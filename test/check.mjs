@@ -7,7 +7,45 @@
  */
 
 import assert from "node:assert/strict";
-import { DEFAULTS, pickSourceMessages, resolveConfig } from "../lib/config.js";
+import { createRequire } from "node:module";
+import { DEFAULTS, pickSourceMessages, readVolatile, resolveConfig } from "../lib/config.js";
+
+// ---- readVolatile：schemastery volatile 引用必须解包 ----
+// 这是实测踩到的坑：volatile 字段运行时是 {get(){...}} 引用对象，直接读拿到 {},
+// 表现为「设置改了没反应」且不报错。用真实 schemastery 的 Config 造一个来守。
+{
+  let z;
+  try {
+    z = createRequire(import.meta.url)("@deepseek-ai/schemastery");
+  } catch {
+    z = undefined;
+  }
+  if (z === undefined) {
+    console.log("check: schemastery not linked, volatile regression check skipped");
+  } else {
+    const Schema = z.default ?? z;
+    const VolatileConfig = Schema.object({
+      targetWords: Schema.number().step(1).min(1).max(200).volatile(),
+      autoRenameEnabled: Schema.boolean().volatile()
+    });
+    const resolved = VolatileConfig({ targetWords: 7 });
+    // 先确认前提成立：未解包时确实是对象（否则这个回归测试没有意义）
+    assert.equal(typeof resolved.targetWords, "object", "volatile value must be a ref object (premise)");
+    assert.equal(readVolatile(resolved.targetWords), 7, "readVolatile must unwrap the ref");
+    assert.equal(resolveConfig(resolved).targetWords, 7, "resolveConfig must unwrap volatile refs");
+    assert.equal(typeof resolveConfig(resolved).targetWords, "number");
+    // 未设置的 volatile 字段解出来是 undefined，不能覆盖默认值
+    assert.equal(resolveConfig(resolved).autoRenameEnabled, DEFAULTS.autoRenameEnabled);
+  }
+}
+
+// ---- readVolatile：裸值原样返回 ----
+assert.equal(readVolatile(5), 5);
+assert.equal(readVolatile("x"), "x");
+assert.equal(readVolatile(true), true);
+assert.equal(readVolatile(undefined), undefined);
+assert.equal(readVolatile(null), undefined);
+assert.equal(readVolatile({ get: () => 42 }), 42);
 
 // ---- resolveConfig ----
 
