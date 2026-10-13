@@ -1,0 +1,25 @@
+# dsh-auto-rename bundle patch
+#
+# 作为 bundle 被合入 profile 时，本文件做两件事：
+#
+#  1. 插入插件自己的行。宿主半边是 lib/index.js（普通 Cordis 插件），
+#     浏览器半边由 package.json 的 dsh.client 声明加载。
+#
+#  2. 关掉 dsh-base 内置的 session-title-llm 行。
+#     原因：SessionTitleService.register() 全局只接受一个 provider，内置行
+#     先注册就会让本插件的注册抛错（表现为自动命名静默失效）。本插件接管
+#     first-prompt 自动命名，用的是同一套 @deepseek-ai/dsh-session-title-llm
+#     共享实现，只是换了 provider id（写进 session/title 的 source.provider，
+#     标题来源因此可追溯为 dsh-auto-rename）。
+#
+# 若你的 profile 已经在自己那层 cordis.patch.yml 里关过 session-title-llm，
+# 这里重复一次无害（同一行、同一效果）。
+- insert:
+    - id: dsh-auto-rename
+      name: 'dsh-auto-rename'
+      # 声明对这几个宿主服务的依赖，确保 HTTP 桥与 provider 注册时服务已就绪
+      inject: ['sessionTitle', 'llm', 'sessions', 'webServer']
+
+# 关掉内置的 first-prompt LLM provider，把唯一的 provider 名额让给本插件
+- id: session-title-llm
+  disabled: true
