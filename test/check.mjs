@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { DEFAULTS, pickSourceMessages, readVolatile, resolveConfig } from "../lib/config.js";
+import { DEFAULTS, clampTitle, pickRecentMessages, pickSourceMessages, readVolatile, resolveConfig } from "../lib/config.js";
 
 // ---- readVolatile：schemastery volatile 引用必须解包 ----
 // 这是实测踩到的坑：volatile 字段运行时是 {get(){...}} 引用对象，直接读拿到 {},
@@ -100,4 +100,56 @@ assert.deepEqual(pickSourceMessages([]), []);
 assert.deepEqual(pickSourceMessages(undefined), []);
 assert.deepEqual(pickSourceMessages([null, { seq: 1 }]), []);
 
-console.log("check ok: resolveConfig + pickSourceMessages");
+// ---- pickRecentMessages：手动弹窗用最近几条 ----
+
+// 取最后 count 条，并保持时间顺序（不是倒序）
+assert.deepEqual(
+  pickRecentMessages([{ seq: 1, text: "a" }, { seq: 2, text: "b" }, { seq: 3, text: "c" }], 2),
+  [{ seq: 2, text: "b" }, { seq: 3, text: "c" }],
+  "must take the most recent rows in chronological order"
+);
+
+// 不足 count 时有多少给多少
+assert.deepEqual(pickRecentMessages([{ seq: 1, text: "a" }], 3), [{ seq: 1, text: "a" }]);
+
+// 跳过空白，且坏输入不抛
+assert.deepEqual(pickRecentMessages([{ seq: 1, text: "  " }, { seq: 2, text: "b" }], 1), [{ seq: 2, text: "b" }]);
+assert.deepEqual(pickRecentMessages([], 3), []);
+assert.deepEqual(pickRecentMessages(undefined, 3), []);
+
+// 字节预算：多条长消息必须整体落在 maxInputBytes 内。
+// 官方 frameMessages 会 JSON.stringify 整个数组，超了它就抛错，
+// 表现为「建议获取失败」，所以裁剪只能在我们这边做。
+const long = "问".repeat(2000); // 每个 3 字节
+const budgeted = pickRecentMessages(
+  [{ seq: 1, text: long }, { seq: 2, text: long }, { seq: 3, text: long }],
+  3,
+  4096
+);
+assert.equal(budgeted.length, 3);
+assert.ok(
+  Buffer.byteLength(JSON.stringify(budgeted), "utf8") <= 4096,
+  `framed input must fit maxInputBytes, got ${Buffer.byteLength(JSON.stringify(budgeted), "utf8")}`
+);
+// seq 必须原样保留：它要进 session/title-llm-request 审计事件
+assert.deepEqual(budgeted.map((row) => row.seq), [1, 2, 3]);
+
+// 单条也要守预算（自动命名走的是 pickSourceMessages）
+const single = pickSourceMessages([{ seq: 7, text: long }], 4096);
+assert.ok(Buffer.byteLength(JSON.stringify(single), "utf8") <= 4096);
+assert.equal(single[0].seq, 7);
+
+// ---- clampTitle：官方完全不截，长度只能自己守 ----
+
+assert.equal(clampTitle("代码改动审阅与大量提问", 12), "代码改动审阅与大量提问", "within the cap is untouched");
+assert.equal(clampTitle("一二三四五六七八九十甲乙丙丁", 12), "一二三四五六七八九十甲乙", "hard cap at 12 CJK");
+// 截断点正好落在标点后时，把标点一起去掉（不留「短标题、」这种尾巴）
+assert.equal(clampTitle("短标题、后面还有很长的话", 3), "短标题", "a trailing separator is dropped");
+// 标点不计入字数上限：数满 4 个汉字时，顿号不算数
+assert.equal(clampTitle("一二、三四五", 4), "一二、三四", "punctuation does not consume the budget");
+// 拉丁字母不计入 CJK 上限（英文标题按 targetWords 走，按字符截会切断单词）
+assert.equal(clampTitle("Rename sessions automatically", 6), "Rename sessions automatically");
+assert.equal(clampTitle("", 12), "");
+assert.equal(clampTitle(undefined, 12), undefined);
+
+console.log("check ok: resolveConfig + pickSourceMessages + pickRecentMessages + clampTitle");

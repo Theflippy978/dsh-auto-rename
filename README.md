@@ -42,29 +42,42 @@ dsh plugin --profile desktop add <本仓库路径>
 
 ## 设置
 
-设置 → 插件 → 自动重命名。全部字段可留空表示「用默认值 / 跟随对话主模型」。
+设置 → 插件 → 点开 `dsh-auto-rename` 详情页的配置区。表单用宿主官方的
+`SettingsForm`，所以样式、暂存草稿与「保存」按钮跟其它插件的设置页一致：
+改完要点保存才写盘，留空表示「用默认值 / 跟随对话主模型」。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | 首个对话自动命名 | 开 | 关掉后不再自动改名，建议功能仍可用 |
-| Provider / Model | 空 | 留空 = 跟随当前对话的主模型；两者必须成对填写 |
+| 命名 Provider / Model | 空 | 留空 = 跟随当前对话的主模型；两者必须成对填写 |
 | 建议条数 | 3 | 打开重命名窗口时拉取几条候选（1–5） |
-| 输出上限 | 64 | 单次生成的 token 上限 |
+| 输出上限（token） | 64 | 单次生成的 token 上限 |
 | 超时（毫秒） | 60000 | |
-| 目标词数 | 5 | 非 CJK 语言的词数目标 |
-| 目标中文字数 | 10 | CJK 字符数目标 |
+| 目标词数 | 5 | 非中文标题的词数目标 |
+| 中文字数上限 | 12 | 中文标题最多几个字，**超出会硬截断** |
 
 > Provider / Model 只填一个不会生效：会在启动日志里出现一条警告，且用到时明确报错。
 > 这是刻意的——半对配置静默失效比报错更难排查。
 
+### 命名读的是什么
+
+两种场景都**只看人类发的消息**，完全不看助手回复：
+
+- **首个对话自动命名**：只取第一条人类消息。与 Codex 的 first-prompt 语义一致，
+  也最省 token。
+- **重命名窗口的建议**：取最近 3 条人类消息，因此能概括进行中的话题而不只是开场白。
+
+两边都按 `maxInputBytes`（默认 4096）逐条裁剪后再交给模型——官方共享实现在输入
+超限时是直接抛错的，不裁就会表现为「建议获取失败」。
+
 ## 结构
 
 ```
-lib/config.js    纯逻辑（配置合并、源消息挑选），无依赖，可独立测试
+lib/config.js    纯逻辑（配置合并、源消息挑选、标题截断），无依赖，可独立测试
 lib/index.js     Host 半边：注册 provider + HTTP 桥（/dsh-auto-rename/suggest）
-lib/client.js    Client 半边：顶部按钮 + 重命名 Modal + 设置卡片
+lib/client.js    Client 半边：顶部按钮 + 重命名 Modal + 设置卡片（官方 SettingsForm）
 cordis.patch.yml bundle patch：插入本插件行、禁用内置 session-title-llm 行
-test/            自检（node test/check.mjs / node test/apply-smoke.mjs）
+test/            自检（check / apply-smoke / client-smoke / patch-check）
 ```
 
 Host 与 client 之间只有两条 HTTP 路由，都只接受本机来源（`127.0.0.1` 且
@@ -79,7 +92,9 @@ Host 与 client 之间只有两条 HTTP 路由，都只接受本机来源（`127
 npm run check
 ```
 
-跑三件事：两半的语法检查、纯逻辑自检、以及用假 ctx 的 `apply()` 冒烟测试。
+跑四件事：两半的语法检查、纯逻辑自检（含标题截断与字节预算）、host `apply()` 冒烟、
+client `apply()` 冒烟（假 ctx 真渲染顶部入口与设置卡片），以及 `cordis.patch.yml`
+的组合结果。
 
 冒烟测试需要一个 `@deepseek-ai/schemastery`。本地开发时从已装的 profile 链一份进来：
 
@@ -93,9 +108,13 @@ New-Item -ItemType Junction -Path node_modules\@deepseek-ai\schemastery `
 
 ## 已知边界
 
-- 依赖 `conversation.session.header.actions` 槽位（DSH 0.2.0-rc.2 已声明）。
-  宿主升级若改动槽位名，按钮会消失，但自动命名不受影响。
+- 顶部按钮依赖 `conversation.session.header.actions`，设置卡片依赖
+  `plugins.bundle.config`（均为 DSH 0.2.0-rc.2 已声明的槽位）。宿主升级若改动
+  槽位名，对应界面会静默消失——槽位没被声明时 `slots.inject` 的回调根本不触发，
+  不会报错。设置卡片缺席时顶部按钮仍在，反之亦然。
 - 自动命名与建议共用同一套 LLM 调用（委托官方 `@deepseek-ai/dsh-session-title-llm`
   的共享实现），因此提示词、超时、归一化行为与内置 provider 完全一致。
+  长度上限是本插件额外加的：官方把 `normalizeSessionTitle` 的截断参数传成
+  `Number.MAX_SAFE_INTEGER`，等于完全不截，所以「最多几个字」由我们兜底。
 - 建议不会往会话日志写 `session/title-llm-request` 事件：那是自动命名的一次性审计
   记录，而建议可以反复重新生成，照写会让日志膨胀。
