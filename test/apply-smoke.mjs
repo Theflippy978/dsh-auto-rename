@@ -74,6 +74,20 @@ assert.equal(name, "dsh-auto-rename");
 assert.deepEqual(inject, ["sessionTitle", "llm", "sessions", "webServer"]);
 assert.ok(Config, "Config must be exported");
 
+// 标题长度只有 targetCjkCharacters 一个旋钮：targetWords 已从 schema 移除，
+// 由 resolveConfig 从宽度预算派生。schema 是宿主 loader 校验 profile 的依据，
+// 留着它就会让「改了没反应」变成界面能填、后端不认。
+assert.deepEqual(Object.keys(Config.dict), [
+  "provider",
+  "model",
+  "targetCjkCharacters",
+  "maxInputBytes",
+  "maxOutputTokens",
+  "timeoutMs",
+  "suggestionCount",
+  "autoRenameEnabled"
+], "the config schema must expose exactly the user-facing fields");
+
 // ---- 2. 服务缺失时降级，不抛错 ----
 
 {

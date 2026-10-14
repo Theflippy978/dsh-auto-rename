@@ -530,7 +530,6 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
       "plugin-config-auto-rename-suggestionCount",
       "plugin-config-auto-rename-maxOutputTokens",
       "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetWords",
       "plugin-config-auto-rename-targetCjkCharacters"
     ],
     "every remaining field renders exactly once"
@@ -549,7 +548,6 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
       "plugin-config-auto-rename-suggestionCount",
       "plugin-config-auto-rename-maxOutputTokens",
       "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetWords",
       "plugin-config-auto-rename-targetCjkCharacters"
     ],
     "with no catalog the two hand-entry fields come back, and only they"
@@ -648,7 +646,6 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
       "plugin-config-auto-rename-suggestionCount",
       "plugin-config-auto-rename-maxOutputTokens",
       "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetWords",
       "plugin-config-auto-rename-targetCjkCharacters"
     ],
     "provider/model hand-entry fields are gone once the catalog is available"
@@ -670,7 +667,11 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   const afterRows = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
   const picked = renderModelRow(afterRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined));
   assert.equal(picked.props.value, JSON.stringify(["openai", "gpt-4o-mini"]), "the pick is reflected back into the select");
-  assert.equal(afterRows.filter((row) => row.type === "SettingsValueField").length, 5);
+  assert.equal(
+    afterRows.filter((row) => row.type === "SettingsValueField").length,
+    4,
+    "picking a model stages provider+model only, it never adds editable fields"
+  );
   // 选完是「已覆盖」，恢复默认要能把两个字段一起清空
   const resetRow = afterRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
   assert.equal(resetRow.props.provider.overridden, true, "a picked route reads as an override");

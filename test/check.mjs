@@ -25,15 +25,15 @@ import { DEFAULTS, clampTitle, pickRecentMessages, pickSourceMessages, readVolat
   } else {
     const Schema = z.default ?? z;
     const VolatileConfig = Schema.object({
-      targetWords: Schema.number().step(1).min(1).max(200).volatile(),
+      suggestionCount: Schema.number().step(1).min(1).max(5).volatile(),
       autoRenameEnabled: Schema.boolean().volatile()
     });
-    const resolved = VolatileConfig({ targetWords: 7 });
+    const resolved = VolatileConfig({ suggestionCount: 4 });
     // 先确认前提成立：未解包时确实是对象（否则这个回归测试没有意义）
-    assert.equal(typeof resolved.targetWords, "object", "volatile value must be a ref object (premise)");
-    assert.equal(readVolatile(resolved.targetWords), 7, "readVolatile must unwrap the ref");
-    assert.equal(resolveConfig(resolved).targetWords, 7, "resolveConfig must unwrap volatile refs");
-    assert.equal(typeof resolveConfig(resolved).targetWords, "number");
+    assert.equal(typeof resolved.suggestionCount, "object", "volatile value must be a ref object (premise)");
+    assert.equal(readVolatile(resolved.suggestionCount), 4, "readVolatile must unwrap the ref");
+    assert.equal(resolveConfig(resolved).suggestionCount, 4, "resolveConfig must unwrap volatile refs");
+    assert.equal(typeof resolveConfig(resolved).suggestionCount, "number");
     // 未设置的 volatile 字段解出来是 undefined，不能覆盖默认值
     assert.equal(resolveConfig(resolved).autoRenameEnabled, DEFAULTS.autoRenameEnabled);
   }
@@ -52,7 +52,7 @@ assert.equal(readVolatile({ get: () => 42 }), 42);
 // 空配置：全默认，无显式路由（跟随对话主模型）
 const empty = resolveConfig();
 assert.equal(empty.route, undefined, "empty config must not pin a route");
-assert.equal(empty.targetWords, DEFAULTS.targetWords, "empty config keeps defaults");
+assert.equal(empty.targetCjkCharacters, 12, "empty config keeps defaults");
 assert.equal(empty.autoRenameEnabled, true, "auto rename is on by default");
 
 // 显式成对：解出 route
@@ -67,13 +67,30 @@ assert.throws(() => resolveConfig({ model: "group/never-stuck" }), /must be conf
 assert.equal(resolveConfig({ provider: "", model: "" }).route, undefined);
 
 // 覆盖生效，且未覆盖的字段保持默认
-const overridden = resolveConfig({ targetWords: 7, suggestionCount: 2 });
-assert.equal(overridden.targetWords, 7);
+const overridden = resolveConfig({ suggestionCount: 2 });
 assert.equal(overridden.suggestionCount, 2);
 assert.equal(overridden.maxOutputTokens, DEFAULTS.maxOutputTokens);
 
 // undefined 值不得覆盖默认（schemastery volatile 未设置时就是 undefined）
-assert.equal(resolveConfig({ targetWords: undefined }).targetWords, DEFAULTS.targetWords);
+assert.equal(resolveConfig({ suggestionCount: undefined }).suggestionCount, DEFAULTS.suggestionCount);
+
+// ---- targetWords 是派生值，不是用户旋钮 ----
+// 用户口径：英文不设词数上限，只受「中文 12 字」换算出的显示宽度约束。
+// 但官方 generateSessionTitleWithLlm 要求它是正整数（提示词也要用），
+// 所以从宽度预算折算：预算 = 字数 × 2 个半角单位，一个英文词按 6 单位估。
+assert.equal(resolveConfig().targetWords, 4, "12 CJK -> 24 units -> 4 words");
+// 用户存过的 targetWords 必须被派生值覆盖，否则它又变回第二个旋钮
+assert.equal(resolveConfig({ targetWords: 99 }).targetWords, 4, "a stored targetWords is ignored");
+assert.equal(
+  resolveConfig({ targetCjkCharacters: 24 }).targetWords,
+  8,
+  "the derived word target tracks the width knob, not a fixed number"
+);
+assert.equal(
+  resolveConfig({ targetCjkCharacters: 1 }).targetWords,
+  1,
+  "the shared implementation asserts targetWords is a positive integer"
+);
 
 // 关闭自动命名时仍要能解出配置（建议功能依赖它）
 assert.equal(resolveConfig({ autoRenameEnabled: false }).autoRenameEnabled, false);
