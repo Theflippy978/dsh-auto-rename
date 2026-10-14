@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { DEFAULTS, clampTitle, pickRecentMessages, pickSourceMessages, readVolatile, resolveConfig } from "../lib/config.js";
+import { DEFAULTS, clampTitle, pickRecentMessages, pickSourceMessages, readVolatile, resolveConfig, titleWidthUnits } from "../lib/config.js";
 
 // ---- readVolatile：schemastery volatile 引用必须解包 ----
 // 这是实测踩到的坑：volatile 字段运行时是 {get(){...}} 引用对象，直接读拿到 {},
@@ -140,15 +140,27 @@ assert.ok(Buffer.byteLength(JSON.stringify(single), "utf8") <= 4096);
 assert.equal(single[0].seq, 7);
 
 // ---- clampTitle：官方完全不截，长度只能自己守 ----
+// 口径是显示宽度（半角单位）：中日韩字算 2，其余含空格算 1。
+// 预算 = 中文字数上限 × 2，所以「中文 12 字」与「英文 24 字符（含空格）」等宽，
+// 不必再为英文单设一个数（用户 2026-10-14 的口径）。
 
-assert.equal(clampTitle("代码改动审阅与大量提问", 12), "代码改动审阅与大量提问", "within the cap is untouched");
+assert.equal(titleWidthUnits(12), 24, "12 CJK chars budget 24 half-width units");
+assert.equal(clampTitle("代码改动审阅与大量提问", 12), "代码改动审阅与大量提问", "11 CJK = 22 units, inside the 24 budget");
 assert.equal(clampTitle("一二三四五六七八九十甲乙丙丁", 12), "一二三四五六七八九十甲乙", "hard cap at 12 CJK");
-// 截断点正好落在标点后时，把标点一起去掉（不留「短标题、」这种尾巴）
+// 顿号是宽字符，同样占 2 个单位：预算 8 只装得下「一二、三」
+assert.equal(clampTitle("一二、三四五", 4), "一二、三", "wide punctuation counts toward the width");
 assert.equal(clampTitle("短标题、后面还有很长的话", 3), "短标题", "a trailing separator is dropped");
-// 标点不计入字数上限：数满 4 个汉字时，顿号不算数
-assert.equal(clampTitle("一二、三四五", 4), "一二、三四", "punctuation does not consume the budget");
-// 拉丁字母不计入 CJK 上限（英文标题按 targetWords 走，按字符截会切断单词）
-assert.equal(clampTitle("Rename sessions automatically", 6), "Rename sessions automatically");
+// 拉丁按字符算：24 单位 = 24 个英文字符（含空格）
+assert.equal(clampTitle("Rename sessions", 12), "Rename sessions", "15 units is inside 24");
+assert.equal(clampTitle("Rename sessions automatically", 12), "Rename sessions", "cuts at the last whole word");
+// 整段没有空格时（标识符、URL、provider/model 路由）宁可不截：残词比超宽更糟，
+// 宿主那层 maxTitleBytes（80 字节）仍会兜住极端长度。
+// 必须用**超过** 24 单位的串：恰好 24 字符根本不进截断分支，断言就成了恒真废话。
+assert.equal(
+  clampTitle("magpie/group/never-stuck-longer", 12),
+  "magpie/group/never-stuck-longer",
+  "a single unbreakable token is left whole rather than chopped"
+);
 assert.equal(clampTitle("", 12), "");
 assert.equal(clampTitle(undefined, 12), undefined);
 
