@@ -49,15 +49,20 @@ dsh plugin --profile desktop add <本仓库路径>
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | 首个对话自动命名 | 开 | 关掉后不再自动改名，建议功能仍可用 |
-| 命名 Provider / Model | 空 | 留空 = 跟随当前对话的主模型；两者必须成对填写 |
+| 命名模型 | 跟随主模型 | **下拉列出宿主已认证的模型**；选中即同时写入 Provider 与 Model |
 | 建议条数 | 3 | 打开重命名窗口时拉取几条候选（1–5） |
 | 输出上限（token） | 64 | 单次生成的 token 上限 |
 | 超时（毫秒） | 60000 | |
 | 目标词数 | 5 | 非中文标题的词数目标 |
 | 中文字数上限 | 12 | 中文标题最多几个字，**超出会硬截断** |
 
-> Provider / Model 只填一个不会生效：会在启动日志里出现一条警告，且用到时明确报错。
-> 这是刻意的——半对配置静默失效比报错更难排查。
+「命名模型」的数据源是宿主的 `remote.session.modelCatalog()`：它逐个 provider
+试列模型，列不出来的（没配密钥、已停用）不进目录，所以下拉里出现的都是当前
+真能用的模型，不必再手填。若宿主没组合 remote 或目录调用失败，这一行自动退回
+手填 Provider / Model 两个字段——配置能力不会因此消失，其余字段不受影响。
+
+> 手填 Provider / Model 时只填一个不会生效：启动日志里会有一条警告，且用到时
+> 明确报错。这是刻意的——半对配置静默失效比报错更难排查。
 
 ### 命名读的是什么
 
@@ -76,8 +81,9 @@ dsh plugin --profile desktop add <本仓库路径>
 lib/config.js    纯逻辑（配置合并、源消息挑选、标题截断），无依赖，可独立测试
 lib/index.js     Host 半边：注册 provider + HTTP 桥（/dsh-auto-rename/suggest）
 lib/client.js    Client 半边：顶部按钮 + 重命名 Modal + 设置卡片（官方 SettingsForm）
+                 模型下拉的数据源是宿主 remote.session.modelCatalog()
 cordis.patch.yml bundle patch：插入本插件行、禁用内置 session-title-llm 行
-test/            自检（check / apply-smoke / client-smoke / patch-check）
+test/            自检（check / apply-smoke / client-smoke / locale-audit / patch-check）
 ```
 
 Host 与 client 之间只有两条 HTTP 路由，都只接受本机来源（`127.0.0.1` 且
@@ -92,9 +98,9 @@ Host 与 client 之间只有两条 HTTP 路由，都只接受本机来源（`127
 npm run check
 ```
 
-跑四件事：两半的语法检查、纯逻辑自检（含标题截断与字节预算）、host `apply()` 冒烟、
-client `apply()` 冒烟（假 ctx 真渲染顶部入口与设置卡片），以及 `cordis.patch.yml`
-的组合结果。
+跑五件事：两半的语法检查、纯逻辑自检（含标题截断与字节预算）、host `apply()` 冒烟、
+client `apply()` 冒烟（假 ctx 真渲染顶部入口与设置卡片，含模型目录的三种降级）、
+中英字典对齐审计，以及 `cordis.patch.yml` 的组合结果。
 
 冒烟测试需要一个 `@deepseek-ai/schemastery`。本地开发时从已装的 profile 链一份进来：
 

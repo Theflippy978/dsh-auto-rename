@@ -83,11 +83,17 @@ class FakeSettingsFormModel {
   }
   shell() {
     const snapshot = this.scope.getSnapshot();
+    // invalid 要真算：官方实现里 parse 返回 undefined 的草稿会让保存锁住。
+    // 写死 false 的话，"非数字草稿被拒" 这条断言就成了恒真的废话。
+    const invalid = [...this.staged.entries()].some(([name, text]) => {
+      const spec = this.specs.find((entry) => entry.field === name);
+      return spec !== undefined && spec.parse(text) === undefined;
+    });
     return {
       available: snapshot.status === "ready",
       writable: snapshot.writable === true,
       dirty: this.staged.size > 0,
-      invalid: false,
+      invalid: invalid,
       saving: false,
       failed: false
     };
@@ -95,8 +101,12 @@ class FakeSettingsFormModel {
   field(name) {
     const spec = this.specs.find((entry) => entry.field === name);
     if (spec === undefined) throw new Error(`card has no field ${name}`);
-    if (this.staged.has(name)) return { text: this.staged.get(name), overridden: true, invalid: false };
-    return { text: spec.format(this.scope.getSnapshot().value?.[name]), overridden: false, invalid: false };
+    if (!this.staged.has(name)) {
+      return { text: spec.format(this.scope.getSnapshot().value?.[name]), overridden: false, invalid: false };
+    }
+    const text = this.staged.get(name);
+    const write = spec.parse(text);
+    return { text, overridden: write?.kind === "set", invalid: write === undefined };
   }
   actions() {
     return {
@@ -132,6 +142,8 @@ function makeRequire() {
         useState: (initial) => [typeof initial === "function" ? initial() : initial, noop],
         useCallback: (fn) => fn,
         useMemo: (fn) => fn(),
+        // 替身里不跑真实副作用调度，但必须存在：卡片用它触发首次拉目录
+        useEffect: (fn) => fn(),
         useRef: (initial) => ({ current: initial }),
         // React 的真实签名：useSyncExternalStore(subscribe, getSnapshot)。
         // 这里严格按这个契约校验：第一个参数必须能订阅并返回 disposer，
@@ -154,11 +166,25 @@ function makeRequire() {
         IconSparkleRegular: "IconSparkleRegular",
         SettingsForm: "SettingsForm",
         SettingsValueField: "SettingsValueField",
-        settingsTextField: (field) => ({ field, format: String, parse: (text) => ({ kind: "set", value: text }) }),
+        // 与真实实现逐条对齐：format 只认字符串（String(undefined) 会得到
+        // "undefined"，让下拉凭空多出一条假选项）；空串是 clear 而不是 set。
+        settingsTextField: (field) => ({
+          field,
+          format: (value) => (typeof value === "string" ? value : ""),
+          parse: (text) => {
+            const trimmed = text.trim();
+            return trimmed === "" ? { kind: "clear" } : { kind: "set", value: trimmed };
+          }
+        }),
         settingsNumberField: (field) => ({
           field,
           format: (value) => (typeof value === "number" ? String(value) : ""),
-          parse: (text) => (Number.isFinite(Number(text)) ? { kind: "set", value: Number(text) } : undefined)
+          parse: (text) => {
+            const trimmed = text.trim();
+            if (trimmed === "") return { kind: "clear" };
+            const parsed = Number(trimmed);
+            return Number.isFinite(parsed) ? { kind: "set", value: parsed } : undefined;
+          }
         }),
         // 替身：真实实现的契约是 constructor(scope, specs) + bind/shell/field/
         // actions/dispose，scope 需要 getSnapshot/subscribe/mutate。这里只按
@@ -289,6 +315,26 @@ function renderButton(component, props) {
   return button;
 }
 
+/** 把「命名模型」那一行渲染一层，取出里面的 select。 */
+function renderModelRow(row) {
+  const tree = row.type(row.props);
+  const select = [tree, ...tree.children.flat(Infinity)].find((node) => node?.type === "select");
+  assert.ok(select, "the model row must contain a select");
+  return select;
+}
+
+/**
+ * select 的全部 option value（含 optgroup 里的）。
+ * createElement 的 rest 参数会让 optgroup 的 children 嵌套一层数组，所以先摊平。
+ */
+function optionValues(select) {
+  return select.children
+    .flat(Infinity)
+    .flatMap((node) =>
+      node.type === "optgroup" ? node.children.flat(Infinity).map((option) => option.props.value) : [node.props.value]
+    );
+}
+
 /**
  * 把注册项渲染一次：模拟渲染器做的两件事 —— 调 inject 拿 face，
  * 再把 face.hooks 里的 store 绑成 use<Name> 选择器 hook。
@@ -305,23 +351,73 @@ function renderEntry(entry, extraProps = {}) {
   return { props, tree: entry.component(props) };
 }
 
-function makeCtx(slots, sessions, configForms) {
-  return {
+/**
+ * 假 ctx。
+ *
+ * exports.inject 只声明硬性服务（slots/locale/sessions）；configForms 走
+ * ctx.inject 延迟取、remote 走 ctx.get 可选取 —— 替身必须照这个契约给，
+ * 否则测不出「服务缺席时只少一块界面、不炸整个 client」。
+ */
+function makeCtx(slots, sessions, configForms, remote) {
+  const base = {
     slots,
     sessions,
-    configForms,
+    get: (name) => (name === "remote" ? remote : undefined),
     locale: { register: () => () => {}, bind: () => (key) => key },
     effect: (fn) => fn(),
     logger: { warn: () => {} }
+  };
+  base.inject = (deps, callback) => {
+    const scope = Object.assign({}, base);
+    for (const dep of deps) {
+      if (dep === "configForms") scope.configForms = configForms;
+      else if (dep === "remote") scope.remote = remote;
+    }
+    return callback(scope);
+  };
+  return base;
+}
+
+/** 宿主已认证模型目录的替身（形状抄 remote.session.modelCatalog 的返回值）。 */
+function makeRemote(behaviour = {}) {
+  const calls = [];
+  return {
+    calls,
+    session: {
+      modelCatalog: async () => {
+        calls.push(1);
+        if (behaviour.throwing) throw new Error("connection lost");
+        if (behaviour.notOk) return { ok: false, error: { code: "session/unavailable", message: "no host" } };
+        return {
+          ok: true,
+          value: {
+            default: { provider: "magpie", model: "group/main" },
+            routableProviders: ["magpie", "openai"],
+            groups: [
+              { id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }] },
+              { id: "openai", name: "OpenAI", models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }] }
+            ],
+            failures: behaviour.partial ? [{ id: "broken", name: "Broken", message: "no key" }] : []
+          }
+        };
+      }
+    }
   };
 }
 
 const HEADER = "conversation.session.header.actions";
 const CARD = "plugins.bundle.config";
 
+/** 等目录的 promise 链跑完（loadCatalog 是异步的）。 */
+async function flush() {
+  for (let round = 0; round < 5; round++) await new Promise((resolve) => setImmediate(resolve));
+}
+
 // ---- 1. 模块元数据 ----
 assert.equal(typeof exports.apply, "function", "client must export apply");
-assert.deepEqual(exports.inject, ["slots", "locale", "sessions", "configForms"], "client inject list");
+// 只声明硬性服务：configForms 走 ctx.inject、remote 走 ctx.get，
+// 免得部署缺任一个就把整个 client 半边（含顶部按钮）一起弄没。
+assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject list");
 
 // ---- 2. 顶部入口：注册形状 + 真的渲染一次（uSES 参数写反会在这一刻抛） ----
 {
@@ -398,7 +494,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions", "configForms"],
   const summary = renderEntry(cards[0], { view: "summary" });
   assert.equal(summary.tree, "description", "summary renders the one-liner");
 
-  // page 视图：官方 SettingsForm + 每个字段一个 SettingsValueField
+  // page 视图：官方 SettingsForm 外壳 + 表单动作
   const page = renderEntry(cards[0], { view: "page" });
   assert.equal(page.tree.type, "SettingsForm", "the page must use the host's own form frame");
   assert.equal(page.tree.props.state.available, true);
@@ -408,23 +504,10 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions", "configForms"],
     "the form actions come from SettingsFormModel"
   );
   const rows = page.tree.props.children.flat(Infinity).filter(Boolean);
-  const fields = rows.filter((row) => row.type === "SettingsValueField");
-  assert.deepEqual(
-    fields.map((field) => field.props.id),
-    [
-      "plugin-config-auto-rename-provider",
-      "plugin-config-auto-rename-model",
-      "plugin-config-auto-rename-suggestionCount",
-      "plugin-config-auto-rename-maxOutputTokens",
-      "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetWords",
-      "plugin-config-auto-rename-targetCjkCharacters"
-    ],
-    "every editable field renders exactly once"
-  );
+
   // 布尔行走自定义 SwitchRow（官方没有对应字段原语）：手动渲染一层，
   // 确认里面确实只有一个 Switch，且 checked 由暂存文本推导。
-  const switchRow = rows.find((row) => typeof row.type === "function");
+  const switchRow = rows.find((row) => typeof row.type === "function" && row.props.label !== undefined);
   assert.ok(switchRow, "autoRenameEnabled renders as its own row");
   assert.equal(switchRow.props.label, "settings.enable");
   assert.equal(switchRow.props.checked, true, "undefined config reads as enabled");
@@ -434,30 +517,200 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions", "configForms"],
     .filter((node) => node?.type === "Switch");
   assert.equal(switches.length, 1, "the row holds exactly one switch");
   assert.equal(switches[0].props.label, "settings.enable", "the switch is named by the visible text");
-  // 数字字段必须标 numeric，否则宿主不给数字键盘与校验文案
+
+  // 其余字段：默认就是「命名模型」下拉（首帧目录还是 idle，也走下拉，
+  // 不能先闪两个手填框）。
+  const modelRow = rows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
+  assert.ok(modelRow, "the model row is the default control, before the catalog even loads");
+  assert.equal(renderModelRow(modelRow).props.disabled, true, "the select is disabled until the catalog is ready");
+  const numberFields = rows.filter((row) => row.type === "SettingsValueField");
   assert.deepEqual(
-    fields.filter((field) => field.props.numeric === true).map((field) => field.props.id),
-    fields.slice(2).map((field) => field.props.id),
-    "text fields stay non-numeric, number fields are numeric"
+    numberFields.map((field) => field.props.id),
+    [
+      "plugin-config-auto-rename-suggestionCount",
+      "plugin-config-auto-rename-maxOutputTokens",
+      "plugin-config-auto-rename-timeoutMs",
+      "plugin-config-auto-rename-targetWords",
+      "plugin-config-auto-rename-targetCjkCharacters"
+    ],
+    "every remaining field renders exactly once"
   );
-  // 平时不留调试文字
+  // 数字字段必须标 numeric，否则宿主不给数字键盘与校验文案
+  assert.ok(numberFields.every((field) => field.props.numeric === true), "number fields are numeric");
+
+  // 这台机器没组合 remote（本用例没传）→ 目录拿不到 → 只有那一行退回手填
+  await flush();
+  const fallbackRows = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
+  assert.deepEqual(
+    fallbackRows.filter((row) => row.type === "SettingsValueField").map((field) => field.props.id),
+    [
+      "plugin-config-auto-rename-provider",
+      "plugin-config-auto-rename-model",
+      "plugin-config-auto-rename-suggestionCount",
+      "plugin-config-auto-rename-maxOutputTokens",
+      "plugin-config-auto-rename-timeoutMs",
+      "plugin-config-auto-rename-targetWords",
+      "plugin-config-auto-rename-targetCjkCharacters"
+    ],
+    "with no catalog the two hand-entry fields come back, and only they"
+  );
   assert.equal(
-    rows.some((row) => row.type === "p" && row.props?.role === "alert"),
+    fallbackRows.some((row) => typeof row.type === "function" && row.props.catalog !== undefined),
     false,
-    "no debug row while the header entry is healthy"
+    "the select row is gone once the catalog is known-unreachable"
+  );
+  // 入口状态行常驻显示（用户 2026-10-14 明确要求保留：GUI 拿不到渲染进程
+  // console，这行是「按钮到底注册上没有」唯一的可见说明）
+  const statusRow = rows.find((row) => row.type === "p" && row.props.key === "headerStatus");
+  assert.ok(statusRow, "the header status row is always shown");
+  assert.equal(statusRow.children[0], "settings.headerOk", "a healthy entry reports as registered");
+
+  // 别的槽位上别人的 entry 崩溃不能串台改我们的状态
+  assert.ok(slots.watchers.length >= 1, "the plugin subscribed to entry crashes");
+  slots.watchers[0]("conversation.chat.node", {}, new Error("someone else crashed"));
+  assert.equal(
+    renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean)
+      .find((row) => row.props.key === "headerStatus").children[0],
+    "settings.headerOk",
+    "crashes on other slots must not overwrite our status"
   );
 
-  // 编辑只暂存草稿：重新渲染才看到新值，宿主文档在保存前不动
-  fields[0].props.onEdit("magpie");
-  assert.equal(configForms.scope.getSnapshot().value.provider, undefined, "no write before save");
-  const staged = renderEntry(cards[0], { view: "page" });
-  const stagedFields = staged.tree.props.children.flat(Infinity).filter((node) => node?.type === "SettingsValueField");
-  assert.equal(stagedFields[0].props.text, "magpie", "the draft shows up on re-render");
-  assert.equal(stagedFields[0].props.overridden, true, "a staged value reads as an override");
-  assert.equal(staged.tree.props.state.dirty, true, "the form is dirty, so Save unlocks");
+  // 我们自己的 entry 渲染期崩溃（SlotErrorBoundary 静默 abdicate）时，这行必须
+  // 换成原因 —— 否则「按钮不见了」就完全没有线索。
+  slots.watchers[0](HEADER, {}, new Error("received duplicate prop 'sessionId'"));
+  const crashed = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
+  assert.equal(
+    crashed.find((row) => row.props.key === "headerStatus").children[0],
+    "settings.headerBad：received duplicate prop 'sessionId'",
+    "a crashed entry surfaces its reason in the card"
+  );
+
+  // 编辑只暂存草稿：重新渲染才看到新值，宿主文档在保存前不动。
+  // 按 id 取字段，不按索引 —— 目录可达与否会改变字段清单。
+  const editField = (id) =>
+    renderEntry(cards[0], { view: "page" }).tree.props.children
+      .flat(Infinity)
+      .filter(Boolean)
+      .find((row) => row.type === "SettingsValueField" && row.props.id === id);
+
+  editField("plugin-config-auto-rename-suggestionCount").props.onEdit("2");
+  assert.equal(configForms.scope.getSnapshot().value.suggestionCount, undefined, "no write before save");
+  const stagedField = editField("plugin-config-auto-rename-suggestionCount");
+  assert.equal(stagedField.props.text, "2", "the draft shows up on re-render");
+  assert.equal(stagedField.props.overridden, true, "a staged value reads as an override");
+  const stagedForm = renderEntry(cards[0], { view: "page" }).tree.props;
+  assert.equal(stagedForm.state.dirty, true, "the form is dirty, so Save unlocks");
+  assert.equal(stagedForm.state.invalid, false, "a number draft is valid");
+
+  // 非数字草稿必须标成 invalid 并让表单拒绝保存（parse 返回 undefined 的通路）
+  stagedField.props.onEdit("abc");
+  assert.equal(editField("plugin-config-auto-rename-suggestionCount").props.invalid, true, "a non-numeric draft is invalid");
+  assert.equal(
+    renderEntry(cards[0], { view: "page" }).tree.props.state.invalid,
+    true,
+    "the form reports invalid so Save stays locked"
+  );
 }
 
-// ---- 3b. 宿主未服务该命名空间 → 卡片不注册（不留半张卡） ----
+// ---- 3a. 有 remote 时：provider/model 两个手填字段换成一个已认证模型下拉 ----
+{
+  const slots = makeSlots();
+  const remote = makeRemote();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), remote));
+  const cards = slots.of(CARD);
+  assert.equal(cards.length, 1);
+
+  // 首次渲染：目录还是 idle，但控件已经是下拉（禁用），不会先闪两个手填框；
+  // useEffect 在这一帧触发拉取。
+  const before = renderEntry(cards[0], { view: "page" });
+  const beforeRows = before.tree.props.children.flat(Infinity).filter(Boolean);
+  const beforeSelect = renderModelRow(
+    beforeRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined)
+  );
+  assert.equal(beforeSelect.props.disabled, true, "the select is disabled while the catalog is loading");
+  assert.equal(
+    beforeRows.some((row) => row.type === "SettingsValueField" && row.props.id === "plugin-config-auto-rename-provider"),
+    false,
+    "no hand-entry fields flash before the catalog lands"
+  );
+  await flush();
+  assert.ok(remote.calls.length >= 1, "the card requested the catalog");
+
+  // 目录到位：下拉解禁，选项来自宿主目录
+  const page = renderEntry(cards[0], { view: "page" });
+  assert.equal(page.tree.type, "SettingsForm");
+  const rows = page.tree.props.children.flat(Infinity).filter(Boolean);
+  const modelRow = rows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
+  assert.ok(modelRow, "the model row renders once the catalog is ready");
+  assert.deepEqual(
+    rows.filter((row) => row.type === "SettingsValueField").map((row) => row.props.id),
+    [
+      "plugin-config-auto-rename-suggestionCount",
+      "plugin-config-auto-rename-maxOutputTokens",
+      "plugin-config-auto-rename-timeoutMs",
+      "plugin-config-auto-rename-targetWords",
+      "plugin-config-auto-rename-targetCjkCharacters"
+    ],
+    "provider/model hand-entry fields are gone once the catalog is available"
+  );
+
+  // 下拉内容来自宿主目录：按 provider 分组，value 是 JSON 编码的 route
+  const select = renderModelRow(modelRow);
+  assert.equal(select.props.disabled, false, "the select unlocks once routes are listed");
+  const offered = optionValues(select);
+  assert.deepEqual(offered.slice(0, 2), ["", JSON.stringify(["magpie", "group/never-stuck"])], "follow-main-model plus the first catalog route");
+  assert.ok(offered.includes(JSON.stringify(["openai", "gpt-4o-mini"])), "every provider in the catalog is offered");
+  assert.ok(
+    select.children.flat(Infinity).some((node) => node.type === "optgroup" && node.props.label === "Magpie"),
+    "providers render as optgroups"
+  );
+
+  // 选一条 route → 同时暂存 provider 与 model（host 侧契约不变）
+  modelRow.props.onSelect(JSON.stringify(["openai", "gpt-4o-mini"]));
+  const afterRows = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
+  const picked = renderModelRow(afterRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined));
+  assert.equal(picked.props.value, JSON.stringify(["openai", "gpt-4o-mini"]), "the pick is reflected back into the select");
+  assert.equal(afterRows.filter((row) => row.type === "SettingsValueField").length, 5);
+  // 选完是「已覆盖」，恢复默认要能把两个字段一起清空
+  const resetRow = afterRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
+  assert.equal(resetRow.props.provider.overridden, true, "a picked route reads as an override");
+  resetRow.props.onSelect("");
+  const cleared = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
+  assert.equal(
+    renderModelRow(cleared.find((row) => typeof row.type === "function" && row.props.catalog !== undefined)).props.value,
+    "",
+    "reset puts the select back on follow-main-model"
+  );
+}
+
+// ---- 3b. remote 缺席 / 目录失败 → 退回手填两个字段，不炸 ----
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), undefined));
+  renderEntry(slots.of(CARD)[0], { view: "page" });
+  await flush();
+  const rows = renderEntry(slots.of(CARD)[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
+  assert.ok(
+    rows.some((row) => row.type === "SettingsValueField" && row.props.id === "plugin-config-auto-rename-provider"),
+    "without a catalog the two hand-entry fields come back"
+  );
+}
+
+// ---- 3c. 目录里已无当前值 → 下拉仍显示它，不能悄悄归零 ----
+{
+  const slots = makeSlots();
+  const configForms = makeConfigForms({ value: { provider: "gone", model: "retired-model" } });
+  await exports.apply(makeCtx(slots, makeSessions(), configForms, makeRemote()));
+  renderEntry(slots.of(CARD)[0], { view: "page" });
+  await flush();
+  const rows = renderEntry(slots.of(CARD)[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
+  const select = renderModelRow(rows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined));
+  assert.equal(select.props.value, JSON.stringify(["gone", "retired-model"]), "the stored route stays selected");
+  const offered = optionValues(select);
+  assert.ok(offered.includes(JSON.stringify(["gone", "retired-model"])), "the stale route is offered as its own option");
+}
+
+// ---- 3d. 宿主未服务该命名空间 → 卡片不注册（不留半张卡） ----
 {
   const slots = makeSlots();
   const configForms = makeConfigForms();
@@ -467,7 +720,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions", "configForms"],
   assert.equal(slots.of(HEADER).length, 1, "the header entry is independent of the card");
 }
 
-// ---- 3c. 没有 configForms 服务 → 只有卡片缺席，apply 不炸 ----
+// ---- 3e. 没有 configForms 服务 → 只有卡片缺席，apply 不炸 ----
 {
   const slots = makeSlots();
   await exports.apply(makeCtx(slots, makeSessions(), undefined));
