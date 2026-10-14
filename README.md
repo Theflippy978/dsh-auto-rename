@@ -23,6 +23,11 @@ first-prompt provider 一致，区别只在：
 - 输入框下方一行小字建议栏：3 条候选 chip + 「重新生成」。点击 chip 填入输入框。
 - 回车确认、Esc 关闭、中文输入法组字期间回车不误提交——与原生窗口同款行为。
 
+> 为什么不直接借用原生重命名窗口：它是宿主内部组件，`RenameForm` 里没有任何可注入
+> 的槽位，打开它所需的 `requestSessionRename` 只作为 props 注入侧栏菜单项，整个
+> bundle 也没有 `ctx.provide`。所以插件既塞不进建议条，也无法程序化唤起它，只能
+> 自建——样式则逐条抄原生窗口的 CSS 规则（`_9lTDKa_renameInput` 等）。
+
 提交走官方通道（`sessions.using(id, {source:"workspaceOperation"}, …rename(title))`），
 与侧栏双击标题改名是同一条路。
 
@@ -110,9 +115,10 @@ Host 与 client 之间只有两条 HTTP 路由，都只接受本机来源（`127
 npm run check
 ```
 
-跑五件事：两半的语法检查、纯逻辑自检（含标题截断与字节预算）、host `apply()` 冒烟、
-client `apply()` 冒烟（假 ctx 真渲染顶部入口与设置卡片，含模型目录的三种降级）、
-中英字典对齐审计，以及 `cordis.patch.yml` 的组合结果。
+跑六件事：两半的语法检查、纯逻辑自检（含标题宽度截断与字节预算）、host `apply()`
+冒烟（含 Config schema 字段清单）、client `apply()` 冒烟（假 ctx 真渲染顶部入口与
+设置卡片，含模型目录的三种降级）、中英字典对齐审计，以及 `cordis.patch.yml`
+的组合结果。
 
 冒烟测试需要一个 `@deepseek-ai/schemastery`。本地开发时从已装的 profile 链一份进来：
 
