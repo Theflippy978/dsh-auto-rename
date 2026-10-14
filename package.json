@@ -19,7 +19,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/config.js && node -e \"const s=require('node:fs').readFileSync('lib/client.js','utf8'); new Function('window',s); console.log('parse ok: index.js + config.js + client.js')\" && node test/check.mjs && node test/apply-smoke.mjs && node test/patch-check.mjs"
+    "check": "node --check lib/index.js && node --check lib/config.js && node -e \"const s=require('node:fs').readFileSync('lib/client.js','utf8'); new Function('window',s); console.log('parse ok: index.js + config.js + client.js')\" && node test/check.mjs && node test/apply-smoke.mjs && node test/client-smoke.mjs && node test/patch-check.mjs"
   },
   "dsh": {
     "bundle": {
