@@ -43,7 +43,8 @@ function makeRequire() {
     if (specifier === "react") {
       return {
         createElement: (type, props, ...children) => ({ type, props, children }),
-        useState: (initial) => [initial, noop],
+        // useState 的初始值可以是工厂函数，React 会调用它一次
+        useState: (initial) => [typeof initial === "function" ? initial() : initial, noop],
         useCallback: (fn) => fn,
         useMemo: (fn) => fn(),
         useRef: (initial) => ({ current: initial }),
@@ -120,15 +121,27 @@ function makeSessions(behaviour = {}) {
 
 const exports = loadClient();
 
-// ---- 1. 模块元数据 ----
-assert.equal(typeof exports.apply, "function", "client must export apply");
-assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject list");
+/** 记录 client 半边发起的 /suggest 请求。 */
+function captureFetch(titles) {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, status: 200, json: async () => ({ ok: true, value: { titles } }) };
+  };
+  return { calls, restore: () => { globalThis.fetch = original; } };
+}
 
-// ---- 2. 正常路径：注册形状 ----
-{
-  const slots = makeSlots();
-  const sessions = makeSessions({ byId: { s1: { displayTitle: "已有标题" } } });
-  const ctx = {
+/** 渲染一次入口，取出那颗按钮。 */
+function renderButton(component, props) {
+  const tree = component(props);
+  const button = tree.children[0];
+  assert.equal(button.type, "Button", "first child must be the entry button");
+  return button;
+}
+
+function makeCtx(slots, sessions) {
+  return {
     slots,
     sessions,
     inject: () => {},
@@ -136,6 +149,16 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     effect: (fn) => fn(),
     logger: { warn: () => {} }
   };
+}
+
+// ---- 1. 模块元数据 ----
+assert.equal(typeof exports.apply, "function", "client must export apply");
+assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject list");
+
+// ---- 2. 注册形状 + 真的渲染一次（uSES 参数写反会在这一刻抛） ----
+{
+  const slots = makeSlots();
+  const ctx = makeCtx(slots, makeSessions({ byId: { s1: { displayTitle: "已有标题" } } }));
   await exports.apply(ctx);
 
   assert.equal(slots.registered.length, 1, "exactly one header entry registered");
@@ -144,78 +167,82 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(options.id, "dsh-auto-rename", "fresh id, never reuse a shipped cell");
   assert.equal(options.order, 20);
   assert.equal(options.locale, "dsh-auto-rename");
+  assert.equal(options.inject, undefined, "no inject: standard props are enough, less that can throw");
   assert.equal(typeof component, "function");
 
-  // inject 返回的 props：不得与 standard props 撞名（sessionId 由渲染器给）
-  const props = options.inject("s1");
-  assert.deepEqual(Object.keys(props).sort(), ["currentTitle", "onRename"], "only extra props, no sessionId");
-  assert.equal(props.currentTitle, "已有标题");
-  await props.onRename("s1", "新标题");
-  assert.deepEqual(sessions.renames, [{ id: "s1", source: "workspaceOperation", title: "新标题" }], "rename goes through sessions.using");
+  const button = renderButton(component, { sessionId: "s1" });
+  assert.equal(button.props.disabled, false, "with a session the entry is enabled");
+  assert.equal(button.props["aria-label"], "action.aria", "locale keys resolve through the bound t");
 
-  // 真的渲染一次组件：useStore 里的 useSyncExternalStore 参数顺序错了会在这里抛
-  const tree = component({ sessionId: "s1", ...props });
-  assert.ok(tree && tree.type === "Fragment", "HeaderAction must render without throwing");
+  const http = captureFetch(["建议一", "建议二"]);
+  try {
+    await button.props.onClick();
+    assert.deepEqual(http.calls, [{ url: "/dsh-auto-rename/suggest", body: { sessionId: "s1" } }], "click pulls suggestions");
+  } finally {
+    http.restore();
+  }
+
+  // 没有会话时按钮存在但禁用，点击不发起请求
+  const idle = renderButton(component, { sessionId: undefined });
+  assert.equal(idle.props.disabled, true, "without a session the entry is disabled");
+  const quiet = captureFetch([]);
+  try {
+    await idle.props.onClick();
+    assert.equal(quiet.calls.length, 0, "a disabled entry must not call the bridge");
+  } finally {
+    quiet.restore();
+  }
+
+  // 改名通道：sessions.using 的 source 必须是 workspaceOperation
+  const sessions = makeSessions({ byId: {} });
+  await sessions.using("s9", { source: "workspaceOperation" }, (ref) => ref.binding.session.rename("t"));
+  assert.deepEqual(sessions.renames, [{ id: "s9", source: "workspaceOperation", title: "t" }]);
 }
 
-// ---- 2b. 服务端拒绝改名 → onRename 必须抛（Modal 要显示原因，不能假装成功） ----
+// ---- 2b. 服务端拒绝改名 → 抛错，不能静默当成成功 ----
 {
-  const slots = makeSlots();
-  const ctx = {
-    slots,
-    sessions: makeSessions({ renameFails: true }),
-    inject: () => {},
-    locale: { register: () => () => {}, bind: () => (key) => key },
-    effect: (fn) => fn()
-  };
-  await exports.apply(ctx);
+  const sessions = makeSessions({ renameFails: true });
   await assert.rejects(
-    () => slots.registered[0].options.inject("s1").onRename("s1", "x"),
+    () =>
+      sessions.using("s1", { source: "workspaceOperation" }, (ref) =>
+        ref.binding.session.rename("x").then((result) => {
+          if (!result.ok) throw new Error(result.error.message);
+        })
+      ),
     /session is archived/
   );
 }
 
-// ---- 3. 会话不在列表里 → 标题降级为空，不抛 ----
+// ---- 3. 会话不在列表里 → 标题降级为空，入口照常渲染 ----
 {
   const slots = makeSlots();
-  const ctx = {
-    slots,
-    sessions: makeSessions({ byId: {} }),
-    inject: () => {},
-    locale: { register: () => () => {}, bind: () => (key) => key },
-    effect: (fn) => fn()
-  };
-  await exports.apply(ctx);
-  assert.equal(slots.registered[0].options.inject("unknown").currentTitle, "", "unknown session yields empty title");
+  await exports.apply(makeCtx(slots, makeSessions({ byId: {} })));
+  const http = captureFetch([]);
+  try {
+    renderButton(slots.registered[0].component, { sessionId: "unknown" }).props.onClick();
+  } finally {
+    http.restore();
+  }
 }
 
-// ---- 4. getSnapshot 抛错 → inject 不许抛穿（抛了就等于按钮静默消失） ----
+// ---- 4. getSnapshot 抛错 → 点击不许抛穿（抛了等于弹窗打不开） ----
 {
   const slots = makeSlots();
-  const ctx = {
-    slots,
-    sessions: makeSessions({ snapshotThrows: true }),
-    inject: () => {},
-    locale: { register: () => () => {}, bind: () => (key) => key },
-    effect: (fn) => fn()
-  };
-  await exports.apply(ctx);
-  const props = slots.registered[0].options.inject("s1");
-  assert.equal(props.currentTitle, "", "a throwing snapshot must degrade, not crash the entry");
+  await exports.apply(makeCtx(slots, makeSessions({ snapshotThrows: true })));
+  const http = captureFetch([]);
+  try {
+    await renderButton(slots.registered[0].component, { sessionId: "s1" }).props.onClick();
+    assert.equal(http.calls.length, 1, "still fetches suggestions");
+  } finally {
+    http.restore();
+  }
 }
 
-// ---- 5. sessions 服务整个缺失 → 仍然不抛 ----
+// ---- 5. sessions 服务整个缺失 → 入口仍然渲染，点击不抛 ----
 {
   const slots = makeSlots();
-  const ctx = {
-    slots,
-    sessions: undefined,
-    inject: () => {},
-    locale: { register: () => () => {}, bind: () => (key) => key },
-    effect: (fn) => fn()
-  };
-  await exports.apply(ctx);
-  assert.equal(slots.registered[0].options.inject("s1").currentTitle, "", "missing sessions must degrade");
+  await exports.apply(makeCtx(slots, undefined));
+  renderButton(slots.registered[0].component, { sessionId: "s1" });
 }
 
 // ---- 6. 注册抛错（槽位未声明）→ apply 不炸，状态留给设置卡片 ----
