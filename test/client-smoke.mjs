@@ -62,7 +62,13 @@ function makeRequire() {
       };
     }
     if (specifier === "@deepseek-ai/dsh-client-ui-primitives") {
-      return { Button: "Button", Modal: "Modal", Pill: "Pill", Switch: "Switch" };
+      return {
+        Button: "Button",
+        Modal: "Modal",
+        Pill: "Pill",
+        Switch: "Switch",
+        IconSparkleRegular: "IconSparkleRegular"
+      };
     }
     throw new Error("unexpected require: " + specifier);
   };
@@ -172,7 +178,13 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
   const button = renderButton(component, { sessionId: "s1" });
   assert.equal(button.props.disabled, false, "with a session the entry is enabled");
-  assert.equal(button.props["aria-label"], "action.aria", "locale keys resolve through the bound t");
+  // 原生形态：无边框 ghost + 图标 14 + 可见文字命名（不写 aria-label）
+  assert.equal(button.props.variant, "ghost", "must match the native borderless entry");
+  assert.equal(button.props["aria-label"], undefined, "visible text is its accessible name");
+  assert.equal(button.props.title, "action.aria", "title carries the tooltip");
+  assert.equal(button.props.icon.type, "IconSparkleRegular", "icon + text, like the native labels");
+  assert.equal(button.props.icon.props.size, 14, "native neighbours use size 14");
+  assert.deepEqual(button.children, ["action.label"], "label text comes from the locale table");
 
   const http = captureFetch(["建议一", "建议二"]);
   try {
