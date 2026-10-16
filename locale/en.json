@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AI Conversation Naming",
+    "description": "Names the first prompt automatically and streams AI title suggestions into the rename dialog; the naming model is picked from the Host's authenticated catalog, or follows the conversation's main model."
+  }
+}

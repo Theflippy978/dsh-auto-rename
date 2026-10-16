@@ -1,22 +1,35 @@
 {
   "name": "dsh-auto-rename",
   "version": "0.1.0",
-  "private": true,
   "description": "DSH 自动对话重命名：首个对话自动命名，并在重命名窗口提供 AI 建议",
   "type": "module",
+  "packageManager": "pnpm@11.7.0",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "lib",
     "cordis.patch.yml",
-    "README.md"
+    "icon.svg",
+    "locale",
+    "LICENSE",
+    "README.md",
+    "README.zh.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "cordis"
   ],
   "engines": {
-    "node": ">=20"
+    "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
     "check": "node --check lib/index.js && node --check lib/config.js && node -e \"const s=require('node:fs').readFileSync('lib/client.js','utf8'); new Function('window',s); console.log('parse ok: index.js + config.js + client.js')\" && node test/check.mjs && node test/apply-smoke.mjs && node test/client-smoke.mjs && node test/locale-audit.mjs && node test/patch-check.mjs"
@@ -54,5 +67,13 @@
     "@deepseek-ai/schemastery": "^3.18.4",
     "react": "^18.2.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Theflippy978/dsh-auto-rename.git"
+  },
+  "homepage": "https://github.com/Theflippy978/dsh-auto-rename#readme",
+  "bugs": {
+    "url": "https://github.com/Theflippy978/dsh-auto-rename/issues"
+  }
 }

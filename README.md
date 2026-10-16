@@ -1,144 +1,199 @@
+<div align="center">
+
+<img src="icon.svg" width="112" height="112" alt="dsh-auto-rename icon" />
+
 # dsh-auto-rename
 
-给 DSH 的对话自动重命名：**首个对话自动命名**（Codex 式）+ **重命名窗口里的 AI 建议**。
+**Automatic conversation naming for DeepSeek Harness.**
+The first prompt names itself, and the rename dialog streams AI suggestions.
 
-## 功能
+[![version](https://img.shields.io/badge/version-0.1.0-4176e6)](package.json)
+[![license](https://img.shields.io/badge/license-MIT-4176e6)](LICENSE)
+[![dsh](https://img.shields.io/badge/DSH-0.2.0--rc.2-6b7280)](#known-limits)
+[![node](https://img.shields.io/badge/node-%E2%89%A522.19-6b7280)](package.json)
 
-### 1. 首个对话自动命名
+English · [中文](README.zh.md)
 
-会话发出第一条消息、标题仍为空时，自动调用模型生成标题。行为与 DSH 内置的
-first-prompt provider 一致，区别只在：
+</div>
 
-- provider id 是 `dsh-auto-rename`，写进 `session/title` 的 `source.provider`，
-  标题来源因此可追溯（日志里能区分「DSH 内置命名的」与「本插件命名的」）。
-- 命名模型可配置（默认跟随当前对话的主模型，可指定便宜的小模型）。
-- 手动重命名后标题被锁定，不再自动改写（DSH 自身的行为，本插件沿用）。
+---
 
-### 2. 重命名窗口的 AI 建议
+## Features
 
-对话页顶部（`创造模式` 右侧）有一个「AI 命名」按钮。点开的是一个与 DSH 原生
-重命名窗口形态一致的对话框：
+**Names the first prompt.** When a session sends its first message and the title is still
+empty, a title is generated — once, from that message alone. A manual rename pins the title
+afterwards, so it is never rewritten under your hands.
 
-- 输入框预填当前标题，可直接改。
-- 输入框下方一行小字建议栏：3 条候选 chip + 「重新生成」。点击 chip 填入输入框。
-- 回车确认、Esc 关闭、中文输入法组字期间回车不误提交——与原生窗口同款行为。
+**Suggests titles when you rename.** The **AI Name** button sits at the top of the conversation
+page. Its dialog looks and behaves like DSH's native rename window, with three extra things:
 
-> 为什么不直接借用原生重命名窗口：它是宿主内部组件，`RenameForm` 里没有任何可注入
-> 的槽位，打开它所需的 `requestSessionRename` 只作为 props 注入侧栏菜单项，整个
-> bundle 也没有 `ctx.provide`。所以插件既塞不进建议条，也无法程序化唤起它，只能
-> 自建——样式则逐条抄原生窗口的 CSS 规则（`_9lTDKa_renameInput` 等）。
+| | |
+|---|---|
+| Streaming candidates | Suggestions arrive one at a time (NDJSON), each revealed by a 500 ms left-to-right sweep |
+| One-click apply | Click a chip to fill the input; **Regenerate** for a fresh set |
+| Native feel | Enter confirms, Esc closes, and Enter during IME composition never submits by mistake |
 
-提交走官方通道（`sessions.using(id, {source:"workspaceOperation"}, …rename(title))`），
-与侧栏双击标题改名是同一条路。
+**Uses a model you choose.** Naming follows the conversation's main model by default, or pins a
+cheaper one. The dropdown is built from the host's `remote.session.modelCatalog()`, which
+enumerates providers one by one and drops those that return nothing — so every entry is a model
+the host has actually authenticated and can really call.
 
-## 安装
+**Leaves the audit trail.** The provider id `dsh-auto-rename` is written into `source.provider`
+of every `session/title` event, so you can always tell which titles this plugin produced.
+
+<details>
+<summary><b>Why it builds its own dialog instead of extending the native one</b></summary>
+
+The native rename window is an internal host component with no extension point: `RenameForm`
+declares no injectable slot, the `requestSessionRename` it needs is passed only as a prop into
+sidebar menu items, and nothing in the bundle `ctx.provide`s it. The plugin can therefore
+neither insert a suggestion row into it nor open it programmatically. It builds its own dialog
+and copies the native window's CSS rules one by one, so the two are visually indistinguishable.
+
+</details>
+
+## Install
+
+```sh
+dsh plugin add dsh-auto-rename
+```
+
+From a checkout instead:
 
 ```powershell
-dsh plugin --profile desktop add <本仓库路径>
+dsh plugin --profile desktop add <path-to-this-repo>
 ```
 
-本包声明了 `dsh.bundle.patch`，所以安装时会自动：
+The package declares `dsh.bundle.patch`, so installing it also inserts `dsh-auto-rename` into
+the profile's bundle stack **and disables the built-in `session-title-llm` row from dsh-base**.
+That second part is required: `SessionTitleService.register()` accepts exactly one provider
+globally, so if the built-in row registers first, this plugin's registration throws.
 
-1. 把 `dsh-auto-rename` 插入 profile 的 bundle 栈。
-2. **禁用 dsh-base 内置的 `session-title-llm` 行**——`SessionTitleService.register()`
-   全局只接受一个 provider，内置行先注册就会让本插件的注册抛错。
+Restart DSH afterwards. Client-side changes hot-reload; host-side changes need the restart.
 
-装完重启 DSH。
+## Settings
 
-## 设置
+Open the **AI Name** dialog and click the gear in its title row, left of the close button. The
+panel expands inside the same dialog. Edits are staged in a draft and written only when you
+press **Save**; an empty field means "use the default".
 
-设置 → 插件 → 点开 `dsh-auto-rename` 详情页的配置区。表单用宿主官方的
-`SettingsForm`，所以样式、暂存草稿与「保存」按钮跟其它插件的设置页一致：
-改完要点保存才写盘，留空表示「用默认值 / 跟随对话主模型」。
-
-| 字段 | 默认 | 说明 |
+| Field | Default | Notes |
 |---|---|---|
-| 首个对话自动命名 | 开 | 关掉后不再自动改名，建议功能仍可用 |
-| 命名模型 | 跟随主模型 | **下拉列出宿主已认证的模型**；选中即同时写入 Provider 与 Model |
-| 建议条数 | 3 | 打开重命名窗口时拉取几条候选（1–5） |
-| 输出上限（token） | 64 | 单次生成的 token 上限 |
-| 超时（毫秒） | 60000 | |
-| 标题宽度（中文字数） | 12 | **长度只有这一个旋钮**，超出硬截断 |
+| Rename on first prompt | on | Turning it off leaves suggestions working |
+| Naming model | Follow main model | Lists only models the host has authenticated and can currently list |
+| Suggestions | 3 | Candidates fetched per dialog open (1–5) |
+| Output limit (tokens) | 64 | Per-generation token cap |
+| Timeout (ms) | 60000 | Longest wait for one generated title |
+| Title width (CJK characters) | 12 | **The only length knob**; longer output is truncated |
 
-标题长度按**显示宽度**算，中英文共用同一个预算：1 个中日韩字 = 2 个半角单位，
-其余字符（含空格）= 1 个单位。所以「12」等价于中文最多 12 字、英文最多 **24 个
-字符（含空格）**，约 3–4 词（实测 `Refactor plugin settings` 正好 24 单位）。
+If the host has no remote assembled, or listing fails, the model row falls back to manual
+**Provider** / **Model** fields. They must be filled in pairs: a half-set route logs a warning
+at startup and errors clearly when used, rather than silently doing nothing.
 
-英文**不单独设词数上限** —— 单词字符数不一致，按词数约束没有意义。官方共享实现
-要求一个 `targetWords`（只进提示词，不做截断），这里从宽度预算折算得到
-（24 单位 ÷ 约 6 单位/词 = 4），让模型的目标长度尽量贴着硬截断的预算，减少
-「先写长再被截」。因此调大「标题宽度」会同时放宽中英文，不需要动第二个数。
+## How it works
 
-截断遇到拉丁词中间会回退到上一个空格，不留 `sessio` 这种残词；整段没有空格可退
-（如 `provider/model` 路由、URL）时宁可不截。宿主另有一层 `maxTitleBytes`
-（官方配 80 字节 ≈ 26 个汉字）兜住极端长度，所以宽度旋钮的实际上限在它之下。
+**It reads only what you typed.** Neither path looks at assistant replies: automatic naming
+takes the first human message, suggestions take the three most recent ones so they describe the
+topic in progress rather than the opening line. Each message is clipped to `maxInputBytes`
+(default 4096) before it reaches the model, because the official shared implementation throws
+on oversized input.
 
-「命名模型」的数据源是宿主的 `remote.session.modelCatalog()`：它逐个 provider
-试列模型，列不出来的（没配密钥、已停用）不进目录，所以下拉里出现的都是当前
-真能用的模型，不必再手填。若宿主没组合 remote 或目录调用失败，这一行自动退回
-手填 Provider / Model 两个字段——配置能力不会因此消失，其余字段不受影响。
+**Length is measured in display width, not characters.** One CJK character costs 2 half-width
+units, everything else — spaces included — costs 1. The budget is `Title width × 2`, so the
+default `12` allows 12 Chinese characters or 24 Latin characters including spaces, roughly
+3–4 words. One knob governs both scripts; there is no separate word count for English, because
+word lengths vary too much for a count to mean anything.
 
-> 手填 Provider / Model 时只填一个不会生效：启动日志里会有一条警告，且用到时
-> 明确报错。这是刻意的——半对配置静默失效比报错更难排查。
+The official shared implementation still wants a `targetWords` value (prompt-only, never
+truncating), so it is derived from the same budget at ~6 units per word — `12` yields `4`. That
+keeps the model's target close to the hard cut instead of writing long and being trimmed.
 
-### 命名读的是什么
+**Truncation avoids mangling words.** A cut landing mid-word falls back to the previous space,
+so you never get `sessio`. When there is no space to fall back to — a `provider/model` route, a
+URL — the title is left alone: slightly too wide beats a broken word.
 
-两种场景都**只看人类发的消息**，完全不看助手回复：
+<details>
+<summary><b>Why the plugin has to truncate at all</b></summary>
 
-- **首个对话自动命名**：只取第一条人类消息。与 Codex 的 first-prompt 语义一致，
-  也最省 token。
-- **重命名窗口的建议**：取最近 3 条人类消息，因此能概括进行中的话题而不只是开场白。
+The official caller passes `Number.MAX_SAFE_INTEGER` as the truncation argument of
+`normalizeSessionTitle` — that is, no truncation whatsoever. The host does enforce a
+`maxTitleBytes` ceiling (80 bytes ≈ 26 CJK characters), but it is far too loose to keep titles
+short. So "not too long" is this plugin's job, and the practical ceiling of the width knob sits
+below the host's byte limit.
 
-两边都按 `maxInputBytes`（默认 4096）逐条裁剪后再交给模型——官方共享实现在输入
-超限时是直接抛错的，不裁就会表现为「建议获取失败」。
+</details>
 
-## 结构
+## Project layout
 
 ```
-lib/config.js    纯逻辑（配置合并、源消息挑选、标题截断），无依赖，可独立测试
-lib/index.js     Host 半边：注册 provider + HTTP 桥（/dsh-auto-rename/suggest）
-lib/client.js    Client 半边：顶部按钮 + 重命名 Modal + 设置卡片（官方 SettingsForm）
-                 模型下拉的数据源是宿主 remote.session.modelCatalog()
-cordis.patch.yml bundle patch：插入本插件行、禁用内置 session-title-llm 行
-test/            自检（check / apply-smoke / client-smoke / locale-audit / patch-check）
+lib/config.js    Pure logic: config merge, source-message picking, title truncation.
+                 Zero imports, testable on its own.
+lib/index.js     Host half — registers the title provider and the HTTP bridge.
+lib/client.js    Client half — header button, rename dialog, in-dialog settings panel.
+cordis.patch.yml Bundle patch: insert this plugin, disable built-in session-title-llm.
+locale/          Display metadata for the plugin manager (title, description).
+test/            Self-checks: logic, host apply, client render, locale audit, patch.
 ```
 
-Host 与 client 之间只有两条 HTTP 路由，都只接受本机来源（`127.0.0.1` 且
-`sec-fetch-site` 非 cross-site）：
+The two halves talk over three HTTP routes, each accepting loopback origins only
+(`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) and rejecting `sec-fetch-site: cross-site`:
 
-- `POST /dsh-auto-rename/suggest` — 拉 N 条候选标题
-- `POST /dsh-auto-rename/config` — 回显当前生效配置（排查用）
+| Route | Purpose |
+|---|---|
+| `POST /dsh-auto-rename/suggest` | Stream N candidate titles as NDJSON |
+| `POST /dsh-auto-rename/config` | Echo the currently effective config, for debugging |
+| `POST /dsh-auto-rename/settings` | Write config through the host `settings` service, whitelist-filtered |
 
-## 开发
+The write route answers **503** when the host `settings` service is absent, rather than
+reporting success it did not achieve.
+
+## Development
 
 ```powershell
 npm run check
 ```
 
-跑六件事：两半的语法检查、纯逻辑自检（含标题宽度截断与字节预算）、host `apply()`
-冒烟（含 Config schema 字段清单）、client `apply()` 冒烟（假 ctx 真渲染顶部入口与
-设置卡片，含模型目录的三种降级）、中英字典对齐审计，以及 `cordis.patch.yml`
-的组合结果。
+Six gates, all fast and all offline:
 
-冒烟测试需要一个 `@deepseek-ai/schemastery`。本地开发时从已装的 profile 链一份进来：
+1. Syntax check of the host and config modules, plus a parse check of the client bundle.
+2. Pure-logic self-test — config merge, message picking, the width budget and the byte budget.
+3. Host `apply()` smoke against a fake context: metadata, degradation paths, provider shape,
+   route guards, and the exact Config schema field list.
+4. Client `apply()` smoke: renders the header entry and the settings panel for real, and covers
+   all three catalog degradations. The fake context reproduces the host's restricted facade,
+   including the fact that reading `ctx.inject` throws.
+5. Locale audit: every dictionary key used in code exists in both zh and en.
+6. Patch check: `cordis.patch.yml` disables the built-in row, inserts this one, and touches
+   nothing else.
+
+The smokes need `@deepseek-ai/schemastery`. Locally, junction it from an installed profile:
 
 ```powershell
 New-Item -ItemType Junction -Path node_modules\@deepseek-ai\schemastery `
   -Target "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\@deepseek-ai\schemastery"
 ```
 
-`test/stubs/` 里有一个 `dsh-session-title-llm` 的替身，用来在 DSH 之外验证调用接线
-（它不复制官方实现，只回显收到的参数）。
+`test/stubs/` holds a `dsh-session-title-llm` stand-in that echoes the arguments it receives, so
+the call wiring can be verified outside DSH without reimplementing the official provider.
 
-## 已知边界
+## Known limits
 
-- 顶部按钮依赖 `conversation.session.header.actions`，设置卡片依赖
-  `plugins.bundle.config`（均为 DSH 0.2.0-rc.2 已声明的槽位）。宿主升级若改动
-  槽位名，对应界面会静默消失——槽位没被声明时 `slots.inject` 的回调根本不触发，
-  不会报错。设置卡片缺席时顶部按钮仍在，反之亦然。
-- 自动命名与建议共用同一套 LLM 调用（委托官方 `@deepseek-ai/dsh-session-title-llm`
-  的共享实现），因此提示词、超时、归一化行为与内置 provider 完全一致。
-  长度上限是本插件额外加的：官方把 `normalizeSessionTitle` 的截断参数传成
-  `Number.MAX_SAFE_INTEGER`，等于完全不截，所以「最多几个字」由我们兜底。
-- 建议不会往会话日志写 `session/title-llm-request` 事件：那是自动命名的一次性审计
-  记录，而建议可以反复重新生成，照写会让日志膨胀。
+- **Slot renames fail silently.** The header button depends on `conversation.session.header.actions`,
+  declared in DSH 0.2.0-rc.2. When a slot is not declared, the `slots.inject` callback never
+  fires and nothing throws — so a host upgrade that renames it makes the button vanish without a
+  trace. The version badge above records the host this was last verified against.
+- **Settings are deliberately not on the host settings page.** Both available slots were tried
+  (`plugins.bundle.config` and `plugins.item`): registration succeeds inside an instrumented
+  stand-in, renders nothing in the real UI, and reports no error. The panel is therefore drawn
+  inside the dialog and reads/writes over the HTTP bridge.
+- **Prompts are the official ones.** Automatic naming and suggestions share a single LLM call
+  path, delegated to the shared implementation in `@deepseek-ai/dsh-session-title-llm`, so
+  prompts, timeouts and normalisation match the built-in provider exactly. Only the length cap
+  is this plugin's addition.
+- **Suggestions are not logged.** They do not write a `session/title-llm-request` event: that
+  event is the one-shot audit record for automatic naming, and suggestions can be regenerated
+  without limit, so logging them would bloat the session log.
+
+## License
+
+[MIT](LICENSE)
