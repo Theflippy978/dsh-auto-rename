@@ -39,18 +39,60 @@ function makeWebServer(routes) {
   };
 }
 
-/** 最小 response 替身：记录 status 与 JSON body。 */
+/**
+ * 最小 response 替身：记录 status 与 JSON body。
+ *
+ * headersSent 必须模拟真实语义：node 的 writeHead 一旦调用它就为 true，
+ * 之后不可能再改状态码。替身若不给这个属性，「未开流就失败应走 500」那条
+ * 断言就是恒真的废话（实测踩过：真实环境里 writeHead 后 headersSent 立刻为 true）。
+ */
 function makeRes() {
   return {
     status: undefined,
     headers: undefined,
     body: undefined,
+    headersSent: false,
+    writableEnded: false,
     writeHead(status, headers) {
       this.status = status;
       this.headers = headers;
+      this.headersSent = true;
     },
     end(text) {
       this.body = text === undefined ? undefined : JSON.parse(text);
+      this.writableEnded = true;
+    }
+  };
+}
+
+function makeStreamRes() {
+  return {
+    status: undefined,
+    headers: undefined,
+    chunks: [],
+    ended: false,
+    headersSent: false,
+    writableEnded: false,
+    flushed: false,
+    writeHead(status, headers) {
+      this.status = status;
+      this.headers = headers;
+      this.headersSent = true;
+    },
+    flushHeaders() {
+      this.flushed = true;
+    },
+    write(chunk) {
+      this.chunks.push(String(chunk));
+      return true;
+    },
+    end(chunk) {
+      if (chunk !== undefined) this.write(chunk);
+      this.ended = true;
+      this.writableEnded = true;
+    },
+    get events() {
+      return this.chunks.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
     }
   };
 }
@@ -117,11 +159,12 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.equal(provider.automatic, "first-prompt", "Codex-style first-prompt cadence");
   assert.equal(typeof provider.generate, "function");
 
-  // 路由形状
+  // 路由形状：config 读、settings 写（设置面板）、suggest 拉建议
   assert.deepEqual(
     routes.map((route) => [route.kind, route.path]),
     [
       ["exact", "/dsh-auto-rename/config"],
+      ["exact", "/dsh-auto-rename/settings"],
       ["exact", "/dsh-auto-rename/suggest"]
     ]
   );
@@ -210,8 +253,12 @@ assert.deepEqual(Object.keys(Config.dict), [
   services.set("sessions", { get: () => undefined });
   services.set("webServer", makeWebServer(routes));
   apply(ctx, {});
-  const configRoute = routes[0];
-  const suggestRoute = routes[1];
+  // 按路径取，不用索引：路由数量会变（加设置写路由时索引断言就断过一次）。
+  const routeOf = (path) => routes.find((route) => route.path === path);
+  const configRoute = routeOf("/dsh-auto-rename/config");
+  const suggestRoute = routeOf("/dsh-auto-rename/suggest");
+  const settingsRoute = routeOf("/dsh-auto-rename/settings");
+  assert.ok(configRoute && suggestRoute && settingsRoute, "all three bridge routes must be registered");
 
   // 非本机来源 → 403
   let res = makeRes();
@@ -247,7 +294,7 @@ assert.deepEqual(Object.keys(Config.dict), [
     second.services.set("webServer", makeWebServer(second.routes));
     apply(second.ctx, { provider: "magpie", model: "group/never-stuck" });
     const r = makeRes();
-    await second.routes[0].handler(makeReq({}), r);
+    await second.routes.find((r) => r.path === "/dsh-auto-rename/config").handler(makeReq({}), r);
     assert.deepEqual(r.body.value.route, { provider: "magpie", model: "group/never-stuck" });
   }
 
@@ -274,6 +321,192 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.match(res.body.error, /is not live/);
 }
 
+// ---- 6b. 建议并行生成、先完成先流出；部分失败不丢已到达候选 ----
+
+{
+  const gates = [];
+  let active = 0;
+  let maxActive = 0;
+  const session = {
+    id: "live",
+    snapshotEvents: () => [1, 2, 3].map((seq) => ({
+      type: "user/message",
+      seq,
+      data: { source: { kind: "user" }, content: [{ type: "text", text: `message ${seq}` }] }
+    }))
+  };
+  const { ctx, services, routes } = makeCtx({
+    __testTitleGeneration: ({ selectedMessages }) => new Promise((resolve, reject) => {
+      const index = gates.length;
+      gates.push({
+        resolve: () => {
+          active--;
+          resolve({ title: `Candidate ${index}`, messageSeqs: selectedMessages.map((message) => message.seq) });
+        },
+        reject: (error) => { active--; reject(error); }
+      });
+      active++;
+      maxActive = Math.max(maxActive, active);
+    })
+  });
+  services.set("sessionTitle", { register: () => {} });
+  services.set("llm", {});
+  services.set("sessions", { get: (id) => id === "live" ? session : undefined });
+  services.set("webServer", makeWebServer(routes));
+  apply(ctx, { provider: "magpie", model: "test-model", suggestionCount: 3 });
+
+  const response = makeStreamRes();
+  const pending = routes.find((r) => r.path === "/dsh-auto-rename/suggest").handler(makeReq({ sessionId: "live", count: 3 }), response);
+  for (let attempt = 0; attempt < 20 && gates.length < 3; attempt++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(gates.length, 3, "all candidate generations start before any finishes");
+  assert.equal(maxActive, 3, "three model requests overlap");
+  assert.equal(response.headers["content-type"], "application/x-ndjson; charset=utf-8");
+  assert.equal(response.flushed, true, "headers must be flushed so the client sees them before the first title");
+
+  gates[2].resolve();
+  for (let attempt = 0; attempt < 20 && response.chunks.length < 1; attempt++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(response.events, [{ type: "title", title: "Candidate 2" }], "first completed candidate is written before slower requests finish");
+  assert.equal(response.ended, false, "stream stays open while requests remain");
+
+  gates[1].reject(new Error("one model failed"));
+  for (let attempt = 0; attempt < 20 && response.chunks.length < 2; attempt++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(response.events[1], { type: "error", message: "one model failed" }, "failure is reported without discarding prior candidates");
+  gates[0].resolve();
+  await pending;
+  assert.deepEqual(response.events, [
+    { type: "title", title: "Candidate 2" },
+    { type: "error", message: "one model failed" },
+    { type: "title", title: "Candidate 0" },
+    { type: "done" }
+  ], "results stream in completion order and finish with done");
+  assert.equal(response.ended, true);
+}
+
+// ---- 6c. 三条全失败仍逐条报错并以 done 收尾；未开始就失败才用 500 ----
+
+{
+  const session = {
+    id: "live",
+    snapshotEvents: () => [{
+      type: "user/message",
+      seq: 1,
+      data: { source: { kind: "user" }, content: [{ type: "text", text: "hello" }] }
+    }]
+  };
+  const { ctx, services, routes } = makeCtx({
+    __testTitleGeneration: () => { throw new Error("provider is down"); }
+  });
+  services.set("sessionTitle", { register: () => {} });
+  services.set("llm", {});
+  services.set("sessions", { get: (id) => id === "live" ? session : undefined });
+  services.set("webServer", makeWebServer(routes));
+  apply(ctx, { provider: "magpie", model: "test-model", suggestionCount: 2 });
+
+  const response = makeStreamRes();
+  await routes.find((r) => r.path === "/dsh-auto-rename/suggest").handler(makeReq({ sessionId: "live", count: 2 }), response);
+  assert.deepEqual(response.events, [
+    { type: "error", message: "provider is down" },
+    { type: "error", message: "provider is down" },
+    { type: "done" }
+  ], "every failed candidate reports its own error line, then done closes the stream");
+
+  // 会话里没有人类消息 = 还没开始写流就失败，此时仍应能用状态码表达。
+  const empty = { id: "empty", snapshotEvents: () => [] };
+  const failing = makeCtx({ __testTitleGeneration: () => { throw new Error("unreachable"); } });
+  failing.services.set("sessionTitle", { register: () => {} });
+  failing.services.set("llm", {});
+  failing.services.set("sessions", { get: (id) => id === "empty" ? empty : undefined });
+  failing.services.set("webServer", makeWebServer(failing.routes));
+  apply(failing.ctx, { provider: "magpie", model: "test-model" });
+  const plain = makeRes();
+  await failing.routes.find((r) => r.path === "/dsh-auto-rename/suggest").handler(makeReq({ sessionId: "empty" }), plain);
+  assert.equal(plain.status, 500, "a failure before the stream opens still uses a status code");
+  assert.match(plain.body.error, /no user message/);
+
+  // 半对配置（只配 provider）也是「开流前就注定失败」，必须仍能用 500 表达；
+  // 若把 prepareSuggestions 挪到 openNdjson 之后，这条会退化成 200 + error 行。
+  const half = makeCtx({ __testTitleGeneration: () => { throw new Error("unreachable"); } });
+  half.services.set("sessionTitle", { register: () => {} });
+  half.services.set("llm", {});
+  half.services.set("sessions", { get: (id) => id === "live" ? session : undefined });
+  half.services.set("webServer", makeWebServer(half.routes));
+  apply(half.ctx, { provider: "magpie" });
+  const halfRes = makeRes();
+  await half.routes.find((r) => r.path === "/dsh-auto-rename/suggest").handler(makeReq({ sessionId: "live" }), halfRes);
+  assert.equal(halfRes.status, 500, "a half-pair route must fail before the stream opens");
+  assert.match(halfRes.body.error, /must be configured together/);
+}
+
+// ---- 6d. 设置写路由：白名单 + settings 服务缺席时明确报错 ----
+
+{
+  const { ctx, services, routes } = makeCtx();
+  const updates = [];
+  services.set("sessionTitle", { register: () => {} });
+  services.set("llm", {});
+  services.set("sessions", { get: () => undefined });
+  services.set("webServer", makeWebServer(routes));
+  services.set("settings", { update: async (ns, patch) => updates.push({ ns, patch }) });
+  apply(ctx, {});
+  const settingsRoute = routes.find((r) => r.path === "/dsh-auto-rename/settings");
+
+  // 正常写入：只把白名单字段交给 settings.update，命名空间就是本插件的行 id。
+  let res = makeRes();
+  await settingsRoute.handler(
+    makeReq({ targetCjkCharacters: 16, autoRenameEnabled: false, provider: "magpie", model: "m" }),
+    res
+  );
+  assert.equal(res.status, 200, "a valid patch is accepted");
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].ns, "dsh-auto-rename", "the namespace is this plugin's profile entry id");
+  assert.deepEqual(updates[0].patch, {
+    targetCjkCharacters: 16,
+    autoRenameEnabled: false,
+    provider: "magpie",
+    model: "m"
+  });
+
+  // 信任边界：请求里夹带的未知键必须被丢掉，不能原样写进 profile 行。
+  res = makeRes();
+  await settingsRoute.handler(
+    makeReq({ targetCjkCharacters: 10, evil: { nested: true }, disabled: true, inject: ["shell"] }),
+    res
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(updates[1].patch, { targetCjkCharacters: 10 }, "unknown keys never reach the host settings service");
+
+  // 类型不对的值同样丢掉（字符串数字不隐式转换）。
+  res = makeRes();
+  await settingsRoute.handler(makeReq({ suggestionCount: "3", maxOutputTokens: null }), res);
+  assert.equal(res.status, 400, "a patch with no valid field is rejected");
+  assert.match(res.body.error, /no writable field/);
+  assert.equal(updates.length, 2, "nothing was written for the rejected request");
+
+  // 空字符串的 provider/model 表示「清空 = 跟随主模型」，必须原样传下去（undefined 让宿主删键）。
+  res = makeRes();
+  await settingsRoute.handler(makeReq({ provider: "", model: "  " }), res);
+  assert.equal(res.status, 200);
+  assert.deepEqual(updates[2].patch, { provider: undefined, model: undefined }, "blank route fields clear the override");
+
+  // settings 服务缺席 → 503，不能假装保存成功。
+  const bare = makeCtx();
+  bare.services.set("sessionTitle", { register: () => {} });
+  bare.services.set("llm", {});
+  bare.services.set("sessions", { get: () => undefined });
+  bare.services.set("webServer", makeWebServer(bare.routes));
+  apply(bare.ctx, {});
+  const bareRes = makeRes();
+  await bare.routes.find((r) => r.path === "/dsh-auto-rename/settings").handler(makeReq({ targetCjkCharacters: 12 }), bareRes);
+  assert.equal(bareRes.status, 503, "without the settings service the write fails loudly");
+  assert.match(bareRes.body.error, /settings service is unavailable/);
+}
+
 // ---- 7. 半对配置在启动时警告（抛错会让整棵插件树起不来，所以只警告） ----
 
 {
@@ -294,7 +527,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   second.services.set("sessions", { get: () => undefined });
   second.services.set("webServer", makeWebServer(second.routes));
   apply(second.ctx, { provider: "magpie" });
-  await second.routes[0].handler(makeReq({}), res);
+  await second.routes.find((r) => r.path === "/dsh-auto-rename/config").handler(makeReq({}), res);
   assert.equal(res.status, 500, "a half-pair config must fail loudly when actually used");
   assert.match(res.body.error, /must be configured together/);
 }

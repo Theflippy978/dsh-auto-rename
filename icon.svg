@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="dsh-auto-rename">
+  <rect width="64" height="64" rx="14" fill="#ffffff" stroke="#0000001a" stroke-width="1"/>
+  <path d="M19.95 9.5C19.95 15.8 23.1 18.95 29.4 18.95C23.1 18.95 19.95 22.1 19.95 28.4C19.95 22.1 16.8 18.95 10.5 18.95C16.8 18.95 19.95 15.8 19.95 9.5Z" fill="none" stroke="#4176e6" stroke-width="2.4" stroke-linejoin="round"/>
+  <path d="M20.22 37.84L14 50L26.16 43.78L48.97 20.97L43.03 15.03Z" fill="none" stroke="#4176e6" stroke-width="2.8" stroke-linejoin="miter"/>
+  <path d="M20.22 37.84L26.16 43.78M38.43 19.63L44.37 25.57" fill="none" stroke="#4176e6" stroke-width="2.6" stroke-linecap="round"/>
+</svg>

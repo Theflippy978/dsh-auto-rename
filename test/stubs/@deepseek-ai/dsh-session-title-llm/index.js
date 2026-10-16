@@ -1,5 +1,8 @@
 // 测试替身：只为验证 host 半边的调用接线，不复制官方实现。
 export async function generateSessionTitleWithLlm(ctx, config, request, selectedMessages, titleProvider) {
+  if (typeof ctx.__testTitleGeneration === "function") {
+    return ctx.__testTitleGeneration({ config, request, selectedMessages, titleProvider });
+  }
   if (config.provider === undefined || config.model === undefined) {
     throw new Error("session-title-llm: no logged request route is available; configure provider and model together");
   }

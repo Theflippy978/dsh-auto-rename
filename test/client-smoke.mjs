@@ -21,19 +21,34 @@ const SOURCE = fs.readFileSync(path.join(import.meta.dirname, "..", "lib", "clie
 
 function loadClient() {
   const loaded = [];
+  const styleTags = [];
   const window = {
+    prefersReducedMotion: false,
+    matchMedia: () => ({ matches: window.prefersReducedMotion }),
     __ModuleLoader__: {
       load: (definition) => {
         loaded.push(definition);
       }
     }
   };
+  // 样式注入要一个真的 document：client.js 按宿主官方手法插一个 <style>
+  // （官方写的是裸 `document`，不是 window.document）。断言挂在 styleTags 上，
+  // 所以这里只需最小实现（createElement + head.appendChild + querySelector 去重）。
+  const document = {
+    head: { appendChild: (tag) => styleTags.push(tag) },
+    createElement: () => ({ dataset: {}, textContent: "" }),
+    querySelector: (selector) => {
+      const id = selector.match(/"(.*)"/)?.[1];
+      return styleTags.find((tag) => tag.dataset.pluginCss === id) ?? null;
+    }
+  };
+  globalThis.document = document;
   new Function("window", SOURCE)(window);
   assert.equal(loaded.length, 1, "client.js must call __ModuleLoader__.load exactly once");
   const [definition] = loaded;
   assert.equal(definition.id, "dsh-auto-rename", "module id is the package name");
-  const exports = definition.factory(makeRequire());
-  return exports;
+  const exports = definition.factory(makeRequire(window));
+  return { exports, render: window.__renderComponent, window, styleTags };
 }
 
 /** 只喂 client.js 真正 require 的说明符。 */
@@ -132,38 +147,75 @@ class FakeSettingsFormModel {
   }
 }
 
-function makeRequire() {
+function makeRequire(window) {
   const noop = () => {};
+  const hookSlots = new Map();
+  let activeHooks;
+  /**
+   * 渲染一个组件，并按「组件 + 实例 key」分配持久 hook 槽。
+   *
+   * key 必须按组件区分：HeaderAction 与 RenameDialog 都可能拿到 sessionId "s1"，
+   * 若共用一套槽位，两个组件的 useState 会互相覆盖（表现为「点开面板又自动收起」）。
+   */
+  const renderComponent = (component, props) => {
+    const instance = props?.sessionId ?? props?.target?.sessionId ?? "default";
+    const key = (component.name || "anon") + "@" + instance;
+    let byKey = hookSlots.get(component);
+    if (!byKey) hookSlots.set(component, (byKey = new Map()));
+    let slots = byKey.get(key);
+    if (!slots) byKey.set(key, (slots = []));
+    const previous = activeHooks;
+    activeHooks = { slots, index: 0 };
+    try { return component(props); } finally { activeHooks = previous; }
+  };
+  window.__renderComponent = renderComponent;
+  /**
+   * useState 替身：**必须真的记住状态**。
+   *
+   * 早期版本每次渲染都返回初值，于是「点开设置面板 → 重新渲染」这条路径永远
+   * 回到收起态，测试要么漏掉面板内容、要么得靠手工调 props 绕过 —— 那是假通过。
+   * 这里按组件实例（renderComponent 分配的槽位）存值，setter 写回同一个槽。
+   */
+  const hookValue = (initial) => {
+    if (!activeHooks) throw new Error("React hook rendered outside renderComponent");
+    const frame = activeHooks;
+    const index = frame.index++;
+    if (!(index in frame.slots)) frame.slots[index] = typeof initial === "function" ? initial() : initial;
+    return [frame.slots[index], (next) => {
+      frame.slots[index] = typeof next === "function" ? next(frame.slots[index]) : next;
+    }];
+  };
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: hookValue,
+    useCallback: (fn) => fn,
+    useMemo: (fn) => fn(),
+    // 替身里不跑真实副作用调度，但必须存在：卡片用它触发首次拉目录
+    useEffect: (fn) => fn(),
+    useRef: (initial) => hookValue(() => ({ current: initial }))[0],
+    // React 的真实签名：useSyncExternalStore(subscribe, getSnapshot)。
+    // 这里严格按这个契约校验：第一个参数必须能订阅并返回 disposer，
+    // 第二个必须是取快照的函数 —— 参数写反就直接报错（曾经踩过）。
+    useSyncExternalStore: (subscribe, getSnapshot) => {
+      if (typeof subscribe !== "function") throw new TypeError("arg1 of useSyncExternalStore must be subscribe");
+      if (typeof getSnapshot !== "function") throw new TypeError("arg2 of useSyncExternalStore must be getSnapshot");
+      const disposer = subscribe(noop);
+      if (typeof disposer !== "function") throw new TypeError("subscribe must return a disposer");
+      return getSnapshot();
+    },
+    Fragment: "Fragment"
+  };
   return function require(specifier) {
-    if (specifier === "react") {
-      return {
-        createElement: (type, props, ...children) => ({ type, props, children }),
-        // useState 的初始值可以是工厂函数，React 会调用它一次
-        useState: (initial) => [typeof initial === "function" ? initial() : initial, noop],
-        useCallback: (fn) => fn,
-        useMemo: (fn) => fn(),
-        // 替身里不跑真实副作用调度，但必须存在：卡片用它触发首次拉目录
-        useEffect: (fn) => fn(),
-        useRef: (initial) => ({ current: initial }),
-        // React 的真实签名：useSyncExternalStore(subscribe, getSnapshot)。
-        // 这里严格按这个契约校验：第一个参数必须能订阅并返回 disposer，
-        // 第二个必须是取快照的函数 —— 参数写反就直接报错（曾经踩过）。
-        useSyncExternalStore: (subscribe, getSnapshot) => {
-          if (typeof subscribe !== "function") throw new TypeError("arg1 of useSyncExternalStore must be subscribe");
-          if (typeof getSnapshot !== "function") throw new TypeError("arg2 of useSyncExternalStore must be getSnapshot");
-          const disposer = subscribe(noop);
-          if (typeof disposer !== "function") throw new TypeError("subscribe must return a disposer");
-          return getSnapshot();
-        },
-        Fragment: "Fragment"
-      };
-    }
+    if (specifier === "react") return react;
     if (specifier === "@deepseek-ai/dsh-client-ui-primitives") {
       return {
         Button: "Button",
         Modal: "Modal",
         Switch: "Switch",
+        Menu: "Menu",
         IconSparkleRegular: "IconSparkleRegular",
+        IconSettingsOutlineRegular: "IconSettingsOutlineRegular",
+        IconChevronDownOutlineRegular: "IconChevronDownOutlineRegular",
         SettingsForm: "SettingsForm",
         SettingsValueField: "SettingsValueField",
         // 与真实实现逐条对齐：format 只认字符串（String(undefined) 会得到
@@ -225,10 +277,7 @@ function makeSlots(behaviour = {}) {
   };
 }
 
-/**
- * configForms 替身：get(ns) 给出 SettingsFormModel 需要的 scope，
- * whileServed 立即放行（模拟宿主确实服务这个命名空间）。
- */
+/** configForms 替身：get(ns) 给出 SettingsFormModel 需要的 scope。 */
 function makeConfigForms(behaviour = {}) {
   const listeners = new Set();
   const scope = {
@@ -245,23 +294,11 @@ function makeConfigForms(behaviour = {}) {
     },
     mutate: async () => true
   };
-  let served = false;
   return {
     scope,
     get: (ns) => {
       assert.equal(ns, "dsh-auto-rename", "the form is bound to this plugin's namespace");
       return scope;
-    },
-    whileServed: (namespaces, register) => {
-      served = true;
-      const dispose = register(new Set(namespaces));
-      return () => {
-        served = false;
-        dispose?.();
-      };
-    },
-    get wasServed() {
-      return served;
     }
   };
 }
@@ -294,30 +331,72 @@ function makeSessions(behaviour = {}) {
   };
 }
 
-const exports = loadClient();
+const { exports, render: renderComponent, window: fakeWindow, styleTags } = loadClient();
 
-/** 记录 client 半边发起的 /suggest 请求。 */
-function captureFetch(titles) {
+/** 记录 client 半边发起的请求，并按 NDJSON 逐行回放 /suggest、用 configValue 应答 /config。 */
+function captureFetch(events, options = {}) {
   const calls = [];
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     calls.push({ url, body: JSON.parse(init.body) });
-    return { ok: true, status: 200, json: async () => ({ ok: true, value: { titles } }) };
+    // /config 与 /settings 都是普通 JSON 信封：前者读当前生效值，后者写并回显。
+    if (String(url).endsWith("/config") || String(url).endsWith("/settings")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, value: options.configValue ?? {} })
+      };
+    }
+    const lines = events.map((event) => JSON.stringify(event) + "\n");
+    // split: true 时把每一行再切成两半，模拟「行边界与 chunk 边界不对齐」——
+    // 真实网络下 write() 的分片不保证落在换行处，mock 每次只吐一整行是理想化的。
+    const chunks = options.split
+      ? lines.flatMap((line) => [line.slice(0, 8), line.slice(8)])
+      : lines;
+    let index = 0;
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          // 每次 read 只吐一块：这样测试能断言「第一条到达就渲染」，
+          // 而整体 JSON 的替身做不到这一点。
+          read: async () => (index < chunks.length
+            ? { done: false, value: new TextEncoder().encode(chunks[index++]) }
+            : { done: true })
+        })
+      }
+    };
   };
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
 /** 渲染一次入口，取出那颗按钮。 */
 function renderButton(component, props) {
-  const tree = component(props);
+  const tree = renderComponent(component, props);
   const button = tree.children[0];
-  assert.equal(button.type, "Button", "first child must be the entry button");
+  assert.equal(button.type, "button", "first child must be a native button");
   return button;
+}
+
+/** 渲染一个 createElement 出来的节点（子组件也要走 hook 夹具，否则 useState 会抛）。 */
+function renderNode(node) {
+  return renderComponent(node.type, node.props);
+}
+
+/** 摊平 createElement 的 children（rest 参数会嵌套数组）。 */
+function flattenChildren(node) {
+  return node.children.flat(Infinity).filter(Boolean);
+}
+
+/** 建议栏里的候选按钮（有 title 的那些；「重新生成」没有 title）。 */
+function candidatesOf(node) {
+  return flattenChildren(node).filter((child) => child.type === "Button" && child.props.title !== undefined);
 }
 
 /** 把「命名模型」那一行渲染一层，取出里面的 select。 */
 function renderModelRow(row) {
-  const tree = row.type(row.props);
+  const tree = renderNode(row);
   const select = [tree, ...tree.children.flat(Infinity)].find((node) => node?.type === "select");
   assert.ok(select, "the model row must contain a select");
   return select;
@@ -355,58 +434,98 @@ function renderEntry(entry, extraProps = {}) {
  * 假 ctx。
  *
  * exports.inject 只声明硬性服务（slots/locale/sessions）；configForms 走
- * ctx.inject 延迟取、remote 走 ctx.get 可选取 —— 替身必须照这个契约给，
+ * ctx.inject 延迟取、remote 走 get 可选取 —— 替身必须照这个契约给，
  * 否则测不出「服务缺席时只少一块界面、不炸整个 client」。
+ *
+ * 关键：inject 回调收到的是受限 Context facade，但它的 get(name) 是**可选查找**
+ * （真实实现 readService(name, false)，不要求 name 在 inject 声明里）。
+ *
+ * ⚠️ **`remote.session` 必须注册成独立服务**：宿主 api-gateway 按 namespace 逐个
+ * 注册，`remoteServiceKey(ns)` 返回 `remote.${ns}`（源码实证），所以它**不是**
+ * `remote` 的属性。早期替身写成 `remote = { session: {...} }`，正好掩盖了
+ * 「只 inject remote、读 remote.session」这个真实 bug（用户实测读不到模型目录）。
+ * 别再改回嵌套形状。
  */
-function makeCtx(slots, sessions, configForms, remote) {
+/**
+ * 假 ctx。
+ *
+ * exports.inject 只声明硬性服务（slots/locale/sessions）；`remote.session` 走
+ * `ctx.get` 可选查找 —— 替身必须照这个契约给，否则测不出「服务缺席时只少一块
+ * 界面、不炸整个 client」。
+ *
+ * 关键：apply 收到的 ctx 是 runner 的受限 facade，它的 `get(name)` 是**可选查找**
+ * （真实实现 readService(name, false)，不要求 name 在 inject 声明里）。
+ *
+ * ⚠️ **`remote.session` 必须注册成独立服务**：宿主 api-gateway 按 namespace 逐个
+ * 注册，`remoteServiceKey(ns)` 返回 `remote.${ns}`（源码实证），所以它**不是**
+ * `remote` 的属性。早期替身写成 `remote = { session: {...} }`，正好掩盖了
+ * 「读 remote.session 属性」这个真实 bug（用户实测读不到模型目录）。别再改回嵌套形状。
+ *
+ * ⚠️ **`ctx.inject` 在真实 facade 上根本不存在**，读它**抛错**（不是 undefined）——
+ * runner 的 `dynamicCordisContext` 是个只暴露 `get` + CTX_VERBS 的 Proxy。
+ * 替身照实模拟：谁写了 `ctx.inject`，谁就在这里当场炸。那正是「读不到宿主已认证的
+ * 模型」的根因，这条替身契约就是为了让同类错误立刻暴露。
+ */
+function makeCtx(slots, sessions, configForms, session) {
+  const services = new Map([
+    ["configForms", configForms],
+    ["remote.session", session]
+  ]);
+  const get = (name) => services.get(name);
   const base = {
     slots,
     sessions,
-    get: (name) => (name === "remote" ? remote : undefined),
+    get,
     locale: { register: () => () => {}, bind: () => (key) => key },
     effect: (fn) => fn(),
     logger: { warn: () => {} }
   };
-  base.inject = (deps, callback) => {
-    const scope = Object.assign({}, base);
-    for (const dep of deps) {
-      if (dep === "configForms") scope.configForms = configForms;
-      else if (dep === "remote") scope.remote = remote;
-    }
-    return callback(scope);
+  // 真实的 ctx 有 setInterval/clearInterval（CTX_VERBS 里就有），轮询等服务的
+  // 代码会用到；替身给最小实现：立刻跑一次就停，不真的挂定时器。
+  base.setInterval = (fn) => {
+    fn();
+    return 0;
   };
+  base.clearInterval = () => {};
+  Object.defineProperty(base, "inject", {
+    get() {
+      throw new Error('dynamic ctx does not expose "inject"');
+    }
+  });
   return base;
 }
 
-/** 宿主已认证模型目录的替身（形状抄 remote.session.modelCatalog 的返回值）。 */
+/** 宿主已认证模型目录的替身（形状抄 `remote.session` 服务的 modelCatalog 返回值）。 */
 function makeRemote(behaviour = {}) {
   const calls = [];
   return {
     calls,
-    session: {
-      modelCatalog: async () => {
-        calls.push(1);
-        if (behaviour.throwing) throw new Error("connection lost");
-        if (behaviour.notOk) return { ok: false, error: { code: "session/unavailable", message: "no host" } };
-        return {
-          ok: true,
-          value: {
-            default: { provider: "magpie", model: "group/main" },
-            routableProviders: ["magpie", "openai"],
-            groups: [
-              { id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }] },
-              { id: "openai", name: "OpenAI", models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }] }
-            ],
-            failures: behaviour.partial ? [{ id: "broken", name: "Broken", message: "no key" }] : []
-          }
-        };
-      }
+    modelCatalog: async () => {
+      calls.push(1);
+      if (behaviour.throwing) throw new Error("connection lost");
+      if (behaviour.notOk) return { ok: false, error: { code: "session/unavailable", message: "no host" } };
+      return {
+        ok: true,
+        value: {
+          default: { provider: "magpie", model: "group/main" },
+          routableProviders: ["magpie", "openai"],
+          groups: [
+            { id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }] },
+            { id: "openai", name: "OpenAI", models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }] }
+          ],
+          failures: behaviour.partial ? [{ id: "broken", name: "Broken", message: "no key" }] : []
+        }
+      };
     }
   };
 }
 
 const HEADER = "conversation.session.header.actions";
-const CARD = "plugins.bundle.config";
+// 官方自己的设置页（settings-web-search / -subagent / -agent-loop）都注册到
+// plugins.item（带 id+label，在插件页里作为一个可点条目）。不用 plugins.bundle.config：
+// 那是 keyed 槽，插件管理器按 ledger.bundles.has(pkg.name) 决定详情页里渲不渲染配置区，
+// 而 ledger 又来自该槽位已注册的 key —— 注册没进去就永远不渲染。
+const CARD = "plugins.item";
 
 /** 等目录的 promise 链跑完（loadCatalog 是异步的）。 */
 async function flush() {
@@ -436,21 +555,93 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
   const button = renderButton(component, { sessionId: "s1" });
   assert.equal(button.props.disabled, false, "with a session the entry is enabled");
-  // 原生形态：无边框 ghost + 图标 14 + 可见文字命名（不写 aria-label）
-  assert.equal(button.props.variant, "ghost", "must match the native borderless entry");
+  // 与同槽位的 Agent Team 原生交互标签对齐：默认 tertiary，无底色，hover/focus-visible 变 primary。
+  assert.equal(button.props.type, "button");
+  assert.equal(button.props.style.color, "var(--dsw-alias-label-tertiary)");
+  assert.equal(button.props.style.background, "transparent");
+  assert.equal(button.props.style.border, "0");
   assert.equal(button.props["aria-label"], undefined, "visible text is its accessible name");
   assert.equal(button.props.title, "action.aria", "title carries the tooltip");
-  assert.equal(button.props.icon.type, "IconSparkleRegular", "icon + text, like the native labels");
-  assert.equal(button.props.icon.props.size, 14, "native neighbours use size 14");
-  assert.deepEqual(button.children, ["action.label"], "label text comes from the locale table");
+  assert.equal(button.children[0].type, "IconSparkleRegular", "icon + text, like the native labels");
+  assert.equal(button.children[0].props.size, 14, "native neighbours use size 14");
+  assert.deepEqual(button.children.slice(1), ["action.label"], "label text comes from the locale table");
+  const element = { style: {}, hovered: false, focused: false, matches(selector) {
+    return selector === ":hover" ? this.hovered : selector === ":focus-visible" && this.focused;
+  } };
+  button.props.onMouseEnter({ currentTarget: element });
+  assert.equal(element.style.color, "var(--dsw-alias-label-primary)", "hover emphasizes the label without a fill");
+  element.hovered = false;
+  button.props.onMouseLeave({ currentTarget: element });
+  assert.equal(element.style.color, "var(--dsw-alias-label-tertiary)", "pointer leave restores the native default");
+  element.focused = true;
+  button.props.onFocus({ currentTarget: element });
+  assert.equal(element.style.color, "var(--dsw-alias-label-primary)", "keyboard focus emphasizes the label");
+  element.focused = false;
+  button.props.onBlur({ currentTarget: element });
+  assert.equal(element.style.color, "var(--dsw-alias-label-tertiary)", "blur restores the native default");
 
-  const http = captureFetch(["建议一", "建议二"]);
+  const http = captureFetch([
+    { type: "title", title: "建议一" },
+    { type: "title", title: "建议二" },
+    { type: "done" }
+  ]);
   try {
     await button.props.onClick();
-    assert.deepEqual(http.calls, [{ url: "/dsh-auto-rename/suggest", body: { sessionId: "s1" } }], "click pulls suggestions");
+    // 打开弹窗同时拉建议与当前配置（设置面板要立刻有值），两条都走我们自己的桥。
+    assert.deepEqual(
+      http.calls.map((call) => call.url),
+      ["/dsh-auto-rename/suggest", "/dsh-auto-rename/config"],
+      "opening the dialog pulls suggestions and the current config"
+    );
+    assert.deepEqual(http.calls[0].body, { sessionId: "s1" }, "the suggestion call carries the session id");
   } finally {
     http.restore();
   }
+  const dialog = renderComponent(component, { sessionId: "s1" }).children[1];
+  const modal = renderNode(dialog);
+  const stripElement = modal.children[2];
+  stripElement.props.store.set({ status: "ready", titles: [] });
+  const strip = renderNode(stripElement);
+  const regenerate = strip.children.at(-1);
+  assert.equal(regenerate.props.style.color, "var(--dsw-alias-label-tertiary)", "regenerate matches the gray suggestion heading");
+
+  // 逐条到达：第 2 条还没来，第 1 条就已经渲染出来了（不必等最慢的一条）。
+  stripElement.props.store.set({ status: "loading", titles: ["建议一"] });
+  const partial = renderNode(stripElement);
+  const partialTitles = candidatesOf(partial);
+  assert.deepEqual(partialTitles.map((node) => node.props.title), ["建议一"], "an arrived candidate renders while the rest are still loading");
+  assert.equal(
+    flattenChildren(partial).filter((child) => child.type === "Button" && child.props.title === undefined).length,
+    0,
+    "regenerate stays hidden until the stream finishes"
+  );
+
+  // 扫描线揭示：新挂载的候选会从左往右擦出（clip-path 由右往左收回）。
+  const animated = [];
+  const elementWithAnimate = { animate: (frames, options) => { animated.push({ frames, options }); } };
+  partialTitles[0].props.ref(elementWithAnimate);
+  assert.equal(animated.length, 1, "a freshly mounted candidate plays the reveal");
+  assert.deepEqual(animated[0].frames, [{ clipPath: "inset(0 100% 0 0)" }, { clipPath: "inset(0 0 0 0)" }], "the mask sweeps left to right");
+  assert.equal(animated[0].options.duration, 500, "about half a second");
+
+  // reduced-motion 下不播动画，直接显示。
+  fakeWindow.prefersReducedMotion = true;
+  try {
+    const still = [];
+    partialTitles[0].props.ref({ animate: (frames) => still.push(frames) });
+    assert.equal(still.length, 0, "reduced-motion skips the reveal");
+  } finally {
+    fakeWindow.prefersReducedMotion = false;
+  }
+
+  // 部分失败：已到达的候选保留，状态转为 error 而不是清空。
+  stripElement.props.store.set({ status: "error", titles: ["建议一", "建议二"] });
+  const degraded = renderNode(stripElement);
+  assert.deepEqual(
+    candidatesOf(degraded).map((node) => node.props.title),
+    ["建议一", "建议二"],
+    "a partial failure keeps the candidates that did arrive"
+  );
 
   // 没有会话时按钮存在但禁用，点击不发起请求
   const idle = renderButton(component, { sessionId: undefined });
@@ -478,255 +669,426 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   );
 }
 
-// ---- 3. 设置卡片：注册进 plugins.bundle.config，key 是包名 ----
+// ---- 2c. 行边界与 chunk 边界不对齐时，半行必须被拼回 ----
 {
   const slots = makeSlots();
-  const configForms = makeConfigForms({ value: { targetCjkCharacters: 12 } });
-  await exports.apply(makeCtx(slots, makeSessions(), configForms));
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
+  const component = slots.of(HEADER)[0].component;
 
-  const cards = slots.of(CARD);
-  assert.equal(cards.length, 1, "exactly one settings card registered");
-  assert.equal(cards[0].options.key, "dsh-auto-rename", "the page addresses the card by package name");
-  assert.equal(cards[0].options.locale, "dsh-auto-rename");
-  assert.ok(configForms.wasServed, "the card is gated on the Host serving our namespace");
-
-  // summary 视图：宿主只要一行说明
-  const summary = renderEntry(cards[0], { view: "summary" });
-  assert.equal(summary.tree, "description", "summary renders the one-liner");
-
-  // page 视图：官方 SettingsForm 外壳 + 表单动作
-  const page = renderEntry(cards[0], { view: "page" });
-  assert.equal(page.tree.type, "SettingsForm", "the page must use the host's own form frame");
-  assert.equal(page.tree.props.state.available, true);
-  assert.deepEqual(
-    ["save", "discard", "edit", "resetField"].map((key) => typeof page.props[key]),
-    ["function", "function", "function", "function"],
-    "the form actions come from SettingsFormModel"
-  );
-  const rows = page.tree.props.children.flat(Infinity).filter(Boolean);
-
-  // 布尔行走自定义 SwitchRow（官方没有对应字段原语）：手动渲染一层，
-  // 确认里面确实只有一个 Switch，且 checked 由暂存文本推导。
-  const switchRow = rows.find((row) => typeof row.type === "function" && row.props.label !== undefined);
-  assert.ok(switchRow, "autoRenameEnabled renders as its own row");
-  assert.equal(switchRow.props.label, "settings.enable");
-  assert.equal(switchRow.props.checked, true, "undefined config reads as enabled");
-  const rowTree = switchRow.type(switchRow.props);
-  const switches = [rowTree, ...rowTree.children.flat(Infinity)]
-    .flat(Infinity)
-    .filter((node) => node?.type === "Switch");
-  assert.equal(switches.length, 1, "the row holds exactly one switch");
-  assert.equal(switches[0].props.label, "settings.enable", "the switch is named by the visible text");
-
-  // 其余字段：默认就是「命名模型」下拉（首帧目录还是 idle，也走下拉，
-  // 不能先闪两个手填框）。
-  const modelRow = rows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
-  assert.ok(modelRow, "the model row is the default control, before the catalog even loads");
-  assert.equal(renderModelRow(modelRow).props.disabled, true, "the select is disabled until the catalog is ready");
-  const numberFields = rows.filter((row) => row.type === "SettingsValueField");
-  assert.deepEqual(
-    numberFields.map((field) => field.props.id),
-    [
-      "plugin-config-auto-rename-suggestionCount",
-      "plugin-config-auto-rename-maxOutputTokens",
-      "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetCjkCharacters"
-    ],
-    "every remaining field renders exactly once"
-  );
-  // 数字字段必须标 numeric，否则宿主不给数字键盘与校验文案
-  assert.ok(numberFields.every((field) => field.props.numeric === true), "number fields are numeric");
-
-  // 这台机器没组合 remote（本用例没传）→ 目录拿不到 → 只有那一行退回手填
+  // 每一行都被切成两块喂进去：若客户端不做跨 chunk 缓冲，
+  // JSON.parse 会失败，候选就会静默丢失（表现为「一条建议都没有」）。
+  const http = captureFetch([
+    { type: "title", title: "拆开的建议" },
+    { type: "done" }
+  ], { split: true });
+  let settled;
+  try {
+    const button = renderButton(component, { sessionId: "s1" });
+    settled = button.props.onClick();
+  } finally {
+    // onClick 不返回 promise，等微任务链跑完再断言
+  }
+  await settled;
   await flush();
-  const fallbackRows = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
-  assert.deepEqual(
-    fallbackRows.filter((row) => row.type === "SettingsValueField").map((field) => field.props.id),
-    [
-      "plugin-config-auto-rename-provider",
-      "plugin-config-auto-rename-model",
-      "plugin-config-auto-rename-suggestionCount",
-      "plugin-config-auto-rename-maxOutputTokens",
-      "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetCjkCharacters"
-    ],
-    "with no catalog the two hand-entry fields come back, and only they"
-  );
-  assert.equal(
-    fallbackRows.some((row) => typeof row.type === "function" && row.props.catalog !== undefined),
-    false,
-    "the select row is gone once the catalog is known-unreachable"
-  );
-  // 入口状态行常驻显示（用户 2026-10-14 明确要求保留：GUI 拿不到渲染进程
-  // console，这行是「按钮到底注册上没有」唯一的可见说明）
-  const statusRow = rows.find((row) => row.type === "p" && row.props.key === "headerStatus");
-  assert.ok(statusRow, "the header status row is always shown");
-  assert.equal(statusRow.children[0], "settings.headerOk", "a healthy entry reports as registered");
+  http.restore();
 
-  // 别的槽位上别人的 entry 崩溃不能串台改我们的状态
-  assert.ok(slots.watchers.length >= 1, "the plugin subscribed to entry crashes");
-  slots.watchers[0]("conversation.chat.node", {}, new Error("someone else crashed"));
-  assert.equal(
-    renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean)
-      .find((row) => row.props.key === "headerStatus").children[0],
-    "settings.headerOk",
-    "crashes on other slots must not overwrite our status"
-  );
-
-  // 我们自己的 entry 渲染期崩溃（SlotErrorBoundary 静默 abdicate）时，这行必须
-  // 换成原因 —— 否则「按钮不见了」就完全没有线索。
-  slots.watchers[0](HEADER, {}, new Error("received duplicate prop 'sessionId'"));
-  const crashed = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
-  assert.equal(
-    crashed.find((row) => row.props.key === "headerStatus").children[0],
-    "settings.headerBad：received duplicate prop 'sessionId'",
-    "a crashed entry surfaces its reason in the card"
-  );
-
-  // 编辑只暂存草稿：重新渲染才看到新值，宿主文档在保存前不动。
-  // 按 id 取字段，不按索引 —— 目录可达与否会改变字段清单。
-  const editField = (id) =>
-    renderEntry(cards[0], { view: "page" }).tree.props.children
-      .flat(Infinity)
-      .filter(Boolean)
-      .find((row) => row.type === "SettingsValueField" && row.props.id === id);
-
-  editField("plugin-config-auto-rename-suggestionCount").props.onEdit("2");
-  assert.equal(configForms.scope.getSnapshot().value.suggestionCount, undefined, "no write before save");
-  const stagedField = editField("plugin-config-auto-rename-suggestionCount");
-  assert.equal(stagedField.props.text, "2", "the draft shows up on re-render");
-  assert.equal(stagedField.props.overridden, true, "a staged value reads as an override");
-  const stagedForm = renderEntry(cards[0], { view: "page" }).tree.props;
-  assert.equal(stagedForm.state.dirty, true, "the form is dirty, so Save unlocks");
-  assert.equal(stagedForm.state.invalid, false, "a number draft is valid");
-
-  // 非数字草稿必须标成 invalid 并让表单拒绝保存（parse 返回 undefined 的通路）
-  stagedField.props.onEdit("abc");
-  assert.equal(editField("plugin-config-auto-rename-suggestionCount").props.invalid, true, "a non-numeric draft is invalid");
-  assert.equal(
-    renderEntry(cards[0], { view: "page" }).tree.props.state.invalid,
-    true,
-    "the form reports invalid so Save stays locked"
-  );
+  const dialog = renderComponent(component, { sessionId: "s1" }).children[1];
+  const stripElement = renderNode(dialog).children[2];
+  const titles = candidatesOf(renderNode(stripElement)).map((node) => node.props.title);
+  assert.deepEqual(titles, ["拆开的建议"], "a line split across chunks is reassembled, not dropped");
 }
 
-// ---- 3a. 有 remote 时：provider/model 两个手填字段换成一个已认证模型下拉 ----
+// ---- 2d. 弹窗限高 + 设置图标：两处都是「渲染形态」契约，静默失效就退回用户报的故障 ----
 {
   const slots = makeSlots();
-  const remote = makeRemote();
-  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), remote));
-  const cards = slots.of(CARD);
-  assert.equal(cards.length, 1);
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
+  const component = slots.of(HEADER)[0].component;
 
-  // 首次渲染：目录还是 idle，但控件已经是下拉（禁用），不会先闪两个手填框；
-  // useEffect 在这一帧触发拉取。
-  const before = renderEntry(cards[0], { view: "page" });
-  const beforeRows = before.tree.props.children.flat(Infinity).filter(Boolean);
-  const beforeSelect = renderModelRow(
-    beforeRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined)
+  // 样式表必须真的注入，且只注一次（apply 可能被跑多次）。
+  assert.equal(styleTags.length, 1, "the dialog stylesheet is injected exactly once");
+  const css = styleTags[0].textContent;
+  // 根因断言：宿主 .dialog 自己不设 max-height（官方注释要求调用方 cap growth），
+  // 我们不传就是「整个弹窗上下超出屏幕、标题和底部被裁掉」——用户实测症状。
+  assert.match(css, /\.dsh-auto-rename-dialog\{max-height:100%\}/, "the dialog caps its height");
+  // 滚动必须落在 .body（content 的最后一个子元素），**不能**开在 .content 上。
+  // Edge headless 实测：开在 content 上时滚动条挤压 header 宽度，把关闭键往左推，
+  // 相对 .dialog 定位的设置图标偏了 15px（正好压在关闭键上）。
+  assert.match(
+    css,
+    /\.dsh-auto-rename-dialog-content>:last-child\{overflow-y:auto;min-height:0\}/,
+    "the scroll region is the body, so the header keeps its width"
   );
-  assert.equal(beforeSelect.props.disabled, true, "the select is disabled while the catalog is loading");
-  assert.equal(
-    beforeRows.some((row) => row.type === "SettingsValueField" && row.props.id === "plugin-config-auto-rename-provider"),
-    false,
-    "no hand-entry fields flash before the catalog lands"
+  assert.doesNotMatch(
+    css,
+    /\.dsh-auto-rename-dialog-content\{[^}]*overflow-y:auto/,
+    "the scroll must not sit on .content: its scrollbar would shift the header and the gear"
   );
-  await flush();
-  assert.ok(remote.calls.length >= 1, "the card requested the catalog");
+  // 设置图标钉在关闭键左边：关闭键左边缘距右 42px（header 右 padding 14 + 28 宽），
+  // 再留 8px 间距 = 50px。
+  assert.match(css, /\.dsh-auto-rename-settings\{position:absolute;top:22px;right:50px/, "the gear sits left of the close button");
 
-  // 目录到位：下拉解禁，选项来自宿主目录
-  const page = renderEntry(cards[0], { view: "page" });
-  assert.equal(page.tree.type, "SettingsForm");
-  const rows = page.tree.props.children.flat(Infinity).filter(Boolean);
-  const modelRow = rows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
-  assert.ok(modelRow, "the model row renders once the catalog is ready");
-  assert.deepEqual(
-    rows.filter((row) => row.type === "SettingsValueField").map((row) => row.props.id),
-    [
-      "plugin-config-auto-rename-suggestionCount",
-      "plugin-config-auto-rename-maxOutputTokens",
-      "plugin-config-auto-rename-timeoutMs",
-      "plugin-config-auto-rename-targetCjkCharacters"
-    ],
-    "provider/model hand-entry fields are gone once the catalog is available"
-  );
+  const http = captureFetch([]);
+  try {
+    await renderButton(component, { sessionId: "s1" }).props.onClick();
+  } finally {
+    http.restore();
+  }
+  const modal = renderNode(renderComponent(component, { sessionId: "s1" }).children[1]);
+  assert.equal(modal.type, "Modal", "the dialog is still the host Modal");
+  assert.equal(modal.props.className, "dsh-auto-rename-dialog", "the height cap reaches the Modal");
+  assert.equal(modal.props.contentClassName, "dsh-auto-rename-dialog-content", "so does the scroll region");
+  // 首个子节点就是设置图标：它按绝对定位钉进标题行，DOM 顺序不决定视觉位置。
+  const gear = modal.children[0];
+  assert.equal(gear.type, "button", "the gear is a native button (keyboard + AT semantics)");
+  assert.equal(gear.props.className, "dsh-auto-rename-settings");
+  assert.equal(gear.props["aria-expanded"], false, "collapsed until asked");
+  assert.equal(gear.children[0].type, "IconSettingsOutlineRegular", "a settings glyph, size 14 like the close button");
+  assert.equal(gear.children[0].props.size, 14);
 
-  // 下拉内容来自宿主目录：按 provider 分组，value 是 JSON 编码的 route
-  const select = renderModelRow(modelRow);
-  assert.equal(select.props.disabled, false, "the select unlocks once routes are listed");
-  const offered = optionValues(select);
-  assert.deepEqual(offered.slice(0, 2), ["", JSON.stringify(["magpie", "group/never-stuck"])], "follow-main-model plus the first catalog route");
-  assert.ok(offered.includes(JSON.stringify(["openai", "gpt-4o-mini"])), "every provider in the catalog is offered");
+  // 点开 → aria-expanded 翻真，面板出现在弹窗里。
+  // （替身无法驱动 useState 的 set → re-render 循环，所以这条只断言按钮报出的状态。）
+  gear.props.onClick();
+  assert.equal(gear.props["aria-label"], "settings.show", "the collapsed gear names the action");
+}
+
+// ---- 3. 设置面板：自绘在「AI 命名」弹窗里，不依赖宿主插槽 ----
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
+
+  // 关键契约：不再向宿主的设置槽位注册任何东西。
+  // 历史教训——注册到 plugins.bundle.config / plugins.item 都试过，
+  // 注册代码走通了但真实界面不渲染，且失败是静默的。改成弹窗内自绘后，
+  // 这条断言守住「不要再接回宿主插槽」。
+  assert.equal(slots.of("plugins.item").length, 0, "no settings page is registered into the host's slots any more");
+  assert.equal(slots.of("plugins.bundle.config").length, 0, "nor into the keyed bundle-config slot");
+  assert.equal(slots.of(HEADER).length, 1, "the header entry is still the one host slot we use");
+
+  // 面板直接渲染（不走 React 状态流转：替身无法驱动 useState 的 set → re-render 循环，
+  // 那条路径只会得到假通过）。settingsStore 由测试自己造，语义与 HeaderAction 里一致。
+  const SettingsPanel = exports.__test.SettingsPanel;
+  assert.equal(typeof SettingsPanel, "function", "the panel is exported for direct rendering");
+  const flat = (node) => node.children.flat(Infinity).filter(Boolean);
+
+  // 面板用 useStore(props.store)，所以 store 必须有 getSnapshot/subscribe。
+  const store = (snapshot) => ({ getSnapshot: () => snapshot, subscribe: () => () => {} });
+  const base = {
+    status: "idle",
+    draft: {
+      autoRenameEnabled: true,
+      suggestionCount: 3,
+      maxOutputTokens: 64,
+      timeoutMs: 60000,
+      targetCjkCharacters: 12,
+      provider: "",
+      model: ""
+    },
+    message: ""
+  };
+  const edited = [];
+  // input/Switch 都嵌在「行 div」里，只摊平一层取不到，要递归。
+  // **函数式子组件必须渲染**：React 会调它们（ModelPicker 就是这样嵌在面板里的），
+  // 不展开的话它的输入框与 Menu 全都看不见 —— 断言会静默漏掉整块 UI。
+  const deep = (node, out = []) => {
+    for (const child of flat(node)) {
+      if (typeof child.type === "function" && child.type !== "Fragment") {
+        const rendered = renderNode(child);
+        out.push(rendered);
+        if (Array.isArray(rendered.children)) deep(rendered, out);
+        continue;
+      }
+      out.push(child);
+      if (Array.isArray(child.children)) deep(child, out);
+    }
+    return out;
+  };
+  // 面板现在还需要「宿主已认证模型目录」：命名模型只能从目录里选，不能手填。
+  // 这里给一个带两组 provider 的假目录，语义与 apply 里接 remote 后一致。
+  const catalogStore = (snapshot) => ({ getSnapshot: () => snapshot, subscribe: () => () => {} });
+  const catalogOf = (snapshot = { status: "ready", groups: [] }) => ({
+    store: catalogStore(snapshot),
+    load: () => {},
+    remote: undefined
+  });
+  // 注入的样式表（本块也要用：搜索行的 order:-1 只有 CSS 能表达）。
+  const css = styleTags[0].textContent;
+  const panel = (snapshot = base, catalog = catalogOf()) =>
+    renderNode({
+      type: SettingsPanel,
+      props: {
+        store: store(snapshot),
+        catalog: catalog,
+        onEdit: (field, value) => edited.push([field, value]),
+        onSave: () => {}
+      }
+    });
+  const nodes = (snapshot, catalog) => [panel(snapshot, catalog), ...deep(panel(snapshot, catalog))];
+
+  // 1. 面板读到的就是服务端的生效值，不是空白
+  const inputs = nodes().filter((n) => n.type === "input");
+  const values = inputs.map((n) => n.props.value);
+
+  assert.ok(values.includes("64"), "token limit comes from the live config");
+  assert.ok(values.includes("60000"), "timeout comes from the live config");
+  assert.ok(values.includes("12"), "title width comes from the live config");
   assert.ok(
-    select.children.flat(Infinity).some((node) => node.type === "optgroup" && node.props.label === "Magpie"),
-    "providers render as optgroups"
+    nodes().some((n) => n.type === "Switch" && n.props.checked === true),
+    "the boolean row reflects the live config"
+  );
+  // 留空 = 跟随主模型，不是把字面量 "undefined" 显示给用户
+  assert.ok(
+    inputs.some((n) => n.props.value === "" && n.props["aria-label"] === "settings.provider"),
+    "an unset provider renders as blank, not the string \"undefined\""
   );
 
-  // 选一条 route → 同时暂存 provider 与 model（host 侧契约不变）
-  modelRow.props.onSelect(JSON.stringify(["openai", "gpt-4o-mini"]));
-  const afterRows = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
-  const picked = renderModelRow(afterRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined));
-  assert.equal(picked.props.value, JSON.stringify(["openai", "gpt-4o-mini"]), "the pick is reflected back into the select");
-  assert.equal(
-    afterRows.filter((row) => row.type === "SettingsValueField").length,
-    4,
-    "picking a model stages provider+model only, it never adds editable fields"
+  // 2. 编辑只报给调用方（写草稿），不发请求；点保存才 POST
+  const countInput = inputs.find((n) => n.props["aria-label"] === "settings.count");
+  countInput.props.onChange({ target: { value: "5" } });
+  assert.deepEqual(edited, [["suggestionCount", "5"]], "editing reports the field and raw text upward");
+
+  // 保存动作由 HeaderAction 提供（saveSettings），这里用真的桥验证「点保存会写」。
+  const http = captureFetch([], {
+    configValue: { suggestionCount: 5, targetCjkCharacters: 12, timeoutMs: 60000, maxOutputTokens: 64 }
+  });
+  try {
+    // 直接测 saveConfig 这条桥：点保存最终一定走到它。
+    await exports.__test.saveConfig({ suggestionCount: 5 });
+    const writes = http.calls.filter((c) => c.url.endsWith("/settings"));
+    assert.equal(writes.length, 1, "saving writes exactly once");
+    assert.deepEqual(writes[0].body, { suggestionCount: 5 }, "the staged draft is what gets written");
+  } finally {
+    http.restore();
+  }
+
+  // 3. 保存中：按钮显示 saving 且禁用，避免连点
+  const saving = nodes({ ...base, saving: true })
+    .find((n) => n.type === "Button" && n.children.includes("saving"));
+  assert.ok(saving, "a saving panel shows its busy label");
+  assert.equal(saving.props.disabled, true, "the save button is disabled while saving");
+
+  // 4. 入口状态行仍在面板里（它原本住在从不显示的宿主卡片里，是唯一的可见诊断通道）
+  const headerStore = exports.__test.headerStatusStore;
+  headerStore.set({ state: "registered", message: "" });
+  assert.ok(
+    nodes().some((n) => typeof n.children?.[0] === "string" && n.children[0] === "settings.headerOk"),
+    "the header status line is still surfaced in the panel"
   );
-  // 选完是「已覆盖」，恢复默认要能把两个字段一起清空
-  const resetRow = afterRows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined);
-  assert.equal(resetRow.props.provider.overridden, true, "a picked route reads as an override");
-  resetRow.props.onSelect("");
-  const cleared = renderEntry(cards[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
-  assert.equal(
-    renderModelRow(cleared.find((row) => typeof row.type === "function" && row.props.catalog !== undefined)).props.value,
-    "",
-    "reset puts the select back on follow-main-model"
+  headerStore.set({ state: "pending", message: "" });
+
+  // 5. 圆角方框：设置区必须是一个有边框的框，不能跟建议栏糊在一起。
+  //    边框不能省成「只靠底色」——浅色主题下 bg-layer-1/2/3 全是 #fff（令牌表实测），
+  //    只靠填充的话方框在浅色主题里完全隐形。
+  const root = panel();
+  assert.equal(root.props.style.borderRadius, "var(--dsw-radius-lg)", "the settings block is a rounded box");
+  assert.match(root.props.style.border, /solid/, "the box has a visible border in both themes");
+  assert.ok(root.props.style.marginTop, "it is separated from the suggestion strip above it");
+
+  // 6. 数字行：标签+提示在左、窄数字框在右（右列对齐成一条线）
+  const numbers = nodes().filter((n) => n.type === "input" && n.props.style?.textAlign === "center");
+  assert.equal(numbers.length, 4, "the four numeric fields share one compact control");
+  assert.deepEqual(
+    numbers.map((n) => n.props.style.width),
+    ["76px", "76px", "76px", "76px"],
+    "every numeric control is the same width, so the right column lines up"
+  );
+  for (const control of numbers) {
+    assert.equal(control.props.inputMode, "numeric", "numeric fields ask for the numeric keypad");
+  }
+
+  // 7. 命名模型：两个**只读**框显示当前选择 + 图标按钮打开宿主已认证模型下拉。
+  //    这是用户 2026-10-15 纠正的核心 —— 上一版退化成手填 provider/model，
+  //    手填错一个字符就变成「配置半对」，要到第一次自动命名才报错。
+  const pair = nodes().filter(
+    (n) => n.type === "input" && ["settings.provider", "settings.modelName"].includes(n.props["aria-label"])
+  );
+  assert.equal(pair.length, 2, "both halves of the model route are shown");
+  for (const control of pair) {
+    assert.equal(control.props.readOnly, true, "the route fields are read-only: it must match the Host's catalog");
+    assert.equal(control.props.onChange, undefined, "no hand editing, so no change handler");
+  }
+  assert.deepEqual(
+    pair.map((n) => n.props["aria-label"]),
+    ["settings.provider", "settings.modelName"],
+    "provider comes first, matching how the route is written"
+  );
+
+  // 选择器用宿主官方 P.Menu（自带锚定定位、键盘遍历、外部点击关闭）。
+  const menu = nodes().find((n) => n.type === "Menu");
+  assert.ok(menu, "the picker is an anchored Menu, not a hand-rolled dropdown");
+  assert.equal(menu.props.portal, true, "portal escapes the dialog's overflow clipping");
+  assert.equal(menu.props.open, false, "closed until the icon is pressed");
+
+  // 触发按钮：图标式，带 aria-expanded。它是 Menu 的 anchor（渲染在原位），
+  // 所以不在 children 树里，要从 Menu 的 props 取。
+  const trigger = menu.props.anchor;
+  assert.equal(trigger.type, "button", "the anchor is a native button");
+  assert.equal(trigger.props.className, "dsh-auto-rename-picker");
+  assert.equal(trigger.props["aria-expanded"], false, "collapsed until asked");
+  assert.equal(trigger.props["aria-label"], "settings.pickModel", "the icon carries an accessible name");
+  assert.equal(trigger.children[0].type, "IconChevronDownOutlineRegular", "a chevron marks 'opens a list'");
+
+  // 目录内容：按 provider 分组，第一项固定是「跟随主模型」。
+  const withCatalog = () =>
+    nodes(base, catalogOf({
+      status: "ready",
+      groups: [
+        { id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }, { id: "qoder/qfmodel", name: "qfmodel" }] },
+        { id: "openai", name: "OpenAI", models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }] }
+      ]
+    }));
+  const menuWith = withCatalog().find((n) => n.type === "Menu");
+  const items = menuWith.props.items;
+  assert.equal(items[0].id, "follow", "following the main model is always the first choice");
+  assert.ok(
+    items.some((entry) => entry.type === "label" && entry.text === "Magpie"),
+    "models are grouped under their provider"
+  );
+  // 选中项用 JSON 编码的 route：model id 本身可能含 "/"，拼字符串再 split 会拆错。
+  assert.ok(
+    items.some((entry) => entry.id === JSON.stringify(["magpie", "group/never-stuck"])),
+    "a model id containing a slash survives the round trip"
+  );
+
+  // 选一个模型 → 两个字段一起进草稿（provider + model 是成对的）。
+  menuWith.props.onSelect(JSON.stringify(["openai", "gpt-4o-mini"]));
+  assert.deepEqual(
+    edited.slice(-2),
+    [["provider", "openai"], ["model", "gpt-4o-mini"]],
+    "picking a model stages both halves of the route"
+  );
+  // 选「跟随主模型」→ 两个字段一起清空。
+  menuWith.props.onSelect("follow");
+  assert.deepEqual(edited.slice(-2), [["provider", ""], ["model", ""]], "following the main model clears the route");
+
+  // 当前值不在目录里也要显示出来，否则用户会以为配置丢了。
+  const stale = nodes({ ...base, draft: { ...base.draft, provider: "gone", model: "retired" } }, catalogOf({
+    status: "ready",
+    groups: [{ id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }] }]
+  })).find((n) => n.type === "Menu");
+  assert.ok(
+    stale.props.items.some((entry) => entry.id === JSON.stringify(["gone", "retired"])),
+    "a route missing from the catalog stays visible instead of silently resetting"
+  );
+  assert.equal(stale.props.selectedId, JSON.stringify(["gone", "retired"]), "and it is still shown as the selection");
+
+  // 搜索：目录够大时给一行搜索框，且它靠 CSS order:-1 提到列表最前
+  //（P.Menu 把 children 渲染在 items 之后）。
+  const searchBox = withCatalog().find((n) => n.type === "input" && n.props["aria-label"] === "settings.searchModel");
+  assert.ok(searchBox, "a search row is offered when there is a real catalog");
+  assert.match(
+    css,
+    /\.dsh-auto-rename-picker-search\{order:-1/,
+    "the search row is ordered above the items P.Menu renders before it"
   );
 }
 
-// ---- 3b. remote 缺席 / 目录失败 → 退回手填两个字段，不炸 ----
+// ---- 3b. apply 必须从 `remote.session` 服务取目录，而不是 `remote.session` 属性 ----
+// 这条守住真实故障：宿主 api-gateway 按 namespace 逐个注册服务（`remote.${ns}`），
+// `remote.session` 是**独立服务**。早期实现只 inject `remote` 再读 `remote.session`
+// 属性，恒为 undefined —— 目录永远读不到，用户看到「读不到宿主已认证的模型」。
 {
   const slots = makeSlots();
+  const session = makeRemote();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), session));
+  await flush();
+
+  assert.equal(session.calls.length, 1, "the catalog is fetched from the remote.session service at startup");
+
+  // 目录真的进了 store：打开选择器时应能看到分组的模型，而不是空列表。
+  const http = captureFetch([]);
+  try {
+    await renderButton(slots.of(HEADER)[0].component, { sessionId: "s1" }).props.onClick();
+  } finally {
+    http.restore();
+  }
+  const dialog = renderComponent(slots.of(HEADER)[0].component, { sessionId: "s1" }).children[1];
+  const SettingsPanel = exports.__test.SettingsPanel;
+  const settingsStore = dialog.props.settingsStore;
+  const panel = renderNode({
+    type: SettingsPanel,
+    props: {
+      store: settingsStore,
+      catalog: exports.__test.modelCatalog,
+      onEdit: () => {},
+      onSave: () => {}
+    }
+  });
+  const flat2 = (n) => (n.children ?? []).flat(Infinity).filter(Boolean);
+  const deep2 = (node, out = []) => {
+    for (const child of flat2(node)) {
+      if (typeof child.type === "function" && child.type !== "Fragment") {
+        const rendered = renderNode(child);
+        out.push(rendered);
+        if (Array.isArray(rendered.children)) deep2(rendered, out);
+        continue;
+      }
+      out.push(child);
+      if (Array.isArray(child.children)) deep2(child, out);
+    }
+    return out;
+  };
+  const menu = [panel, ...deep2(panel)].find((n) => n.type === "Menu");
+  assert.ok(menu, "the picker renders");
+  assert.ok(
+    menu.props.items.some((entry) => entry.id === JSON.stringify(["magpie", "group/never-stuck"])),
+    "the live catalog's models reach the picker, so the list is not empty"
+  );
+}
+
+// ---- 3c. 目录首次失败后，服务晚到仍能恢复（一次早失败不能永久卡住） ----
+// ⚠️ modelCatalog 是**模块级单例**（apply 每次接同一个实例），所以这里不假设初始
+// 状态是 error —— 前面的用例可能已经把它拉成 ready。改为验证「拿到服务后一定能用」，
+// 以及「服务缺席时 load() 会如实报 error 而不是假装空目录」。
+{
+  const slots = makeSlots();
+  // 服务缺席时 load() 必须报 error：空列表会让用户以为「宿主没有模型」。
   await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), undefined));
-  renderEntry(slots.of(CARD)[0], { view: "page" });
   await flush();
-  const rows = renderEntry(slots.of(CARD)[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
-  assert.ok(
-    rows.some((row) => row.type === "SettingsValueField" && row.props.id === "plugin-config-auto-rename-provider"),
-    "without a catalog the two hand-entry fields come back"
+  const catalog = exports.__test.modelCatalog;
+  catalog.session = undefined;
+  catalog.load();
+  await flush();
+  assert.equal(
+    catalog.store.getSnapshot().status,
+    "error",
+    "without the service the catalog reports an error instead of pretending to be empty"
+  );
+
+  // 服务随后就绪 → 再接一次必须恢复（真实场景是 inject 回调补上）。
+  const session = makeRemote();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), session));
+  await flush();
+  assert.equal(session.calls.length, 1, "a late-arriving service still gets wired up");
+  assert.equal(
+    catalog.store.getSnapshot().status,
+    "ready",
+    "and the catalog recovers instead of staying broken"
   );
 }
 
-// ---- 3c. 目录里已无当前值 → 下拉仍显示它，不能悄悄归零 ----
+// ---- 3d. 打开选择器时，idle **和 error** 都要重拉（一次早失败不能永久卡住） ----
+// 替身不跑 useEffect 的依赖追踪，所以直接读源码里的判据：
+// 这条守的是「只认 idle」的回归 —— 那会让一次早失败永久停在「读不到模型」。
 {
-  const slots = makeSlots();
-  const configForms = makeConfigForms({ value: { provider: "gone", model: "retired-model" } });
-  await exports.apply(makeCtx(slots, makeSessions(), configForms, makeRemote()));
-  renderEntry(slots.of(CARD)[0], { view: "page" });
-  await flush();
-  const rows = renderEntry(slots.of(CARD)[0], { view: "page" }).tree.props.children.flat(Infinity).filter(Boolean);
-  const select = renderModelRow(rows.find((row) => typeof row.type === "function" && row.props.catalog !== undefined));
-  assert.equal(select.props.value, JSON.stringify(["gone", "retired-model"]), "the stored route stays selected");
-  const offered = optionValues(select);
-  assert.ok(offered.includes(JSON.stringify(["gone", "retired-model"])), "the stale route is offered as its own option");
+  const source = fs.readFileSync(path.join(import.meta.dirname, "..", "lib", "client.js"), "utf8");
+  const effect = source.slice(source.indexOf("React.useEffect(function () {\n        if (open"));
+  const guard = effect.slice(0, effect.indexOf("}, [open"));
+  assert.match(
+    guard,
+    /catalog\.status === "idle" \|\| catalog\.status === "error"/,
+    "opening the picker retries after a failure, not only on the first attempt"
+  );
 }
 
-// ---- 3d. 宿主未服务该命名空间 → 卡片不注册（不留半张卡） ----
+// ---- 3e. 两个只读框的标签不许带「命名」前缀（用户 2026-10-16 明确要求删掉） ----
 {
-  const slots = makeSlots();
-  const configForms = makeConfigForms();
-  configForms.whileServed = () => () => {};
-  await exports.apply(makeCtx(slots, makeSessions(), configForms));
-  assert.equal(slots.of(CARD).length, 0, "an unserved namespace must show no card");
-  assert.equal(slots.of(HEADER).length, 1, "the header entry is independent of the card");
-}
-
-// ---- 3e. 没有 configForms 服务 → 只有卡片缺席，apply 不炸 ----
-{
-  const slots = makeSlots();
-  await exports.apply(makeCtx(slots, makeSessions(), undefined));
-  assert.equal(slots.of(CARD).length, 0);
-  assert.equal(slots.of(HEADER).length, 1);
+  const zh = exports.__test.dictionaries?.zh ?? null;
+  assert.ok(zh, "the Chinese dictionary is exposed for auditing");
+  assert.equal(zh["settings.provider"], "Provider", "the Provider field is labelled plainly");
+  assert.equal(zh["settings.modelName"], "Model", "the Model field is labelled plainly");
+  for (const key of ["settings.provider", "settings.modelName"]) {
+    assert.ok(!zh[key].includes("命名"), `"${key}" must not repeat the section title`);
+  }
 }
 
 // ---- 4. 会话不在列表里 → 标题降级为空，入口照常渲染 ----
@@ -748,7 +1110,11 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   const http = captureFetch([]);
   try {
     await renderButton(slots.of(HEADER)[0].component, { sessionId: "s1" }).props.onClick();
-    assert.equal(http.calls.length, 1, "still fetches suggestions");
+    assert.equal(
+      http.calls.filter((call) => call.url.endsWith("/suggest")).length,
+      1,
+      "still fetches suggestions even when the session snapshot throws"
+    );
   } finally {
     http.restore();
   }

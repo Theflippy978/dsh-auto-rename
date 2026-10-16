@@ -8,7 +8,9 @@ const keys = (block) => new Set([...block.matchAll(/"([a-zA-Z.]+)":/g)].map((m) 
 const zh = keys(zhBlock);
 const en = keys(enBlock);
 
-const used = new Set([...s.matchAll(/\bt\("([a-zA-Z.]+)"\)/g)].map((m) => m[1]));
+// `t("key")` 的调用点。前一个字符必须是"非标识符"——否则 `settings.t("x")`
+// 这种写法会被 `\bt` 从中间的 `.t` 处切开，把键名截断成半截。
+const used = new Set([...s.matchAll(/(?<![\w.$])t\("([a-zA-Z.]+)"\)/g)].map((m) => m[1]));
 // fieldProps(field, labelKey) consumes labelKey and labelKey + "Hint"
 for (const m of s.matchAll(/fieldProps\("\w+", "([\w.]+)"\)/g)) {
   used.add(m[1]);
