@@ -8,9 +8,15 @@
 #  2. 关掉 dsh-base 内置的 session-title-llm 行。
 #     原因：SessionTitleService.register() 全局只接受一个 provider，内置行
 #     先注册就会让本插件的注册抛错（表现为自动命名静默失效）。本插件接管
-#     first-prompt 自动命名，用的是同一套 @deepseek-ai/dsh-session-title-llm
+#     all-prompts 自动命名，用的是同一套 @deepseek-ai/dsh-session-title-llm
 #     共享实现，只是换了 provider id（写进 session/title 的 source.provider，
 #     标题来源因此可追溯为 dsh-auto-rename）。
+#
+# ⚠️ 装了官方 @deepseek-ai/dsh-experimental-session-titles-bundle 的 profile
+#     还多一行 optional-session-title-all-prompts。它由官方 bundle 的 patch 插入，
+#     而 bundle 层按 dsh.profile.bundles 顺序应用 —— 本文件的 patch 跑在前面时
+#     那一行还不存在，写在这里只会得到一条 "entry not found" 警告。所以那一行
+#     必须在 profile 自己的 cordis.patch.yml（所有 bundle 之后）里禁用。
 #
 # 若你的 profile 已经在自己那层 cordis.patch.yml 里关过 session-title-llm，
 # 这里重复一次无害（同一行、同一效果）。

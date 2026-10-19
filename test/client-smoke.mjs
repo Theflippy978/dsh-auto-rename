@@ -339,7 +339,16 @@ function captureFetch(events, options = {}) {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     calls.push({ url, body: JSON.parse(init.body) });
-    // /config 与 /settings 都是普通 JSON 信封：前者读当前生效值，后者写并回显。
+    // `/config` 与 `/settings` 都是普通 JSON 信封：前者读当前生效值，后者写并回显。
+    // failNext 让**下一条** /config 或 /settings 失败 —— 用于验证探测失败不掀桌。
+    if (options.failNext === true) {
+      options.failNext = false;
+      return {
+        ok: false,
+        status: 500,
+        json: async () => ({ ok: false, error: "probe exploded" })
+      };
+    }
     if (String(url).endsWith("/config") || String(url).endsWith("/settings")) {
       return {
         ok: true,
@@ -507,10 +516,10 @@ function makeRemote(behaviour = {}) {
       return {
         ok: true,
         value: {
-          default: { provider: "magpie", model: "group/main" },
-          routableProviders: ["magpie", "openai"],
+          default: { provider: "acme", model: "nested/main" },
+          routableProviders: ["acme", "openai"],
           groups: [
-            { id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }] },
+            { id: "acme", name: "Acme", models: [{ id: "nested/main", name: "nested" }] },
             { id: "openai", name: "OpenAI", models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }] }
           ],
           failures: behaviour.partial ? [{ id: "broken", name: "Broken", message: "no key" }] : []
@@ -772,6 +781,9 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
   // 面板用 useStore(props.store)，所以 store 必须有 getSnapshot/subscribe。
   const store = (snapshot) => ({ getSnapshot: () => snapshot, subscribe: () => () => {} });
+  // 推理能力报告是只读的第二个 store（/config 的 reasoning 字段），默认给 null
+  // 表示「还没探测」，正好覆盖「不显示这一行」的路径。
+  const reasoningOf = (info = null) => store(info);
   const base = {
     status: "idle",
     draft: {
@@ -812,17 +824,23 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   });
   // 注入的样式表（本块也要用：搜索行的 order:-1 只有 CSS 能表达）。
   const css = styleTags[0].textContent;
-  const panel = (snapshot = base, catalog = catalogOf()) =>
+  // 面板还要能吃「草稿覆盖」：换模型后草稿里会留下上一个模型的档位，
+  // 这类构造要能直接喂进去，否则下拉那条路径测不到。
+  const panel = (snapshot = base, catalog = catalogOf(), reasoning = null, draft) =>
     renderNode({
       type: SettingsPanel,
       props: {
-        store: store(snapshot),
+        store: store(draft ? { ...snapshot, draft } : snapshot),
+        reasoningStore: reasoningOf(reasoning),
         catalog: catalog,
         onEdit: (field, value) => edited.push([field, value]),
         onSave: () => {}
       }
     });
-  const nodes = (snapshot, catalog) => [panel(snapshot, catalog), ...deep(panel(snapshot, catalog))];
+  const nodes = (snapshot, catalog, reasoning, draft) => [
+    panel(snapshot, catalog, reasoning, draft),
+    ...deep(panel(snapshot, catalog, reasoning, draft))
+  ];
 
   // 1. 面板读到的就是服务端的生效值，不是空白
   const inputs = nodes().filter((n) => n.type === "input");
@@ -861,10 +879,17 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   }
 
   // 3. 保存中：按钮显示 saving 且禁用，避免连点
-  const saving = nodes({ ...base, saving: true })
+  //    状态字段是 status（idle/loading/saving/saved/error），不是 saving —— 早先
+  //    读 state.saving 恒 undefined，按钮永不禁用、连点会发出多次写。这条断言
+  //    钉住正确字段，别退回假字段。
+  const saving = nodes({ ...base, status: "saving" })
     .find((n) => n.type === "Button" && n.children.includes("saving"));
   assert.ok(saving, "a saving panel shows its busy label");
   assert.equal(saving.props.disabled, true, "the save button is disabled while saving");
+  // 不只在保存中禁用：面板能从 error 态恢复（换模型时档位复位就是借这条路），
+  // 但 idle 态下连点两次会发两次写，所以禁用只由 saving 决定。
+  const idle = nodes({ ...base, status: "idle" }).find((n) => n.type === "Button" && n.children.includes("save"));
+  assert.equal(idle.props.disabled, false, "only the saving state disables the button");
 
   // 4. 入口状态行仍在面板里（它原本住在从不显示的宿主卡片里，是唯一的可见诊断通道）
   const headerStore = exports.__test.headerStatusStore;
@@ -932,7 +957,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     nodes(base, catalogOf({
       status: "ready",
       groups: [
-        { id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }, { id: "qoder/qfmodel", name: "qfmodel" }] },
+        { id: "acme", name: "Acme", models: [{ id: "nested/main", name: "nested" }, { id: "other/second", name: "second" }] },
         { id: "openai", name: "OpenAI", models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }] }
       ]
     }));
@@ -940,12 +965,12 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   const items = menuWith.props.items;
   assert.equal(items[0].id, "follow", "following the main model is always the first choice");
   assert.ok(
-    items.some((entry) => entry.type === "label" && entry.text === "Magpie"),
+    items.some((entry) => entry.type === "label" && entry.text === "Acme"),
     "models are grouped under their provider"
   );
   // 选中项用 JSON 编码的 route：model id 本身可能含 "/"，拼字符串再 split 会拆错。
   assert.ok(
-    items.some((entry) => entry.id === JSON.stringify(["magpie", "group/never-stuck"])),
+    items.some((entry) => entry.id === JSON.stringify(["acme", "nested/main"])),
     "a model id containing a slash survives the round trip"
   );
 
@@ -963,13 +988,135 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   // 当前值不在目录里也要显示出来，否则用户会以为配置丢了。
   const stale = nodes({ ...base, draft: { ...base.draft, provider: "gone", model: "retired" } }, catalogOf({
     status: "ready",
-    groups: [{ id: "magpie", name: "Magpie", models: [{ id: "group/never-stuck", name: "never-stuck" }] }]
+    groups: [{ id: "acme", name: "Acme", models: [{ id: "nested/main", name: "nested" }] }]
   })).find((n) => n.type === "Menu");
   assert.ok(
     stale.props.items.some((entry) => entry.id === JSON.stringify(["gone", "retired"])),
     "a route missing from the catalog stays visible instead of silently resetting"
   );
   assert.equal(stale.props.selectedId, JSON.stringify(["gone", "retired"]), "and it is still shown as the selection");
+
+  // 8. 推理档位说明行：数据来自 /config 的 reasoning（宿主 resolveModelInfo 探测）。
+  //    四种状态必须分开说 —— 把「关不掉只能退最低档」说成「已关闭」就是撒谎。
+  //    假 locale 的 t() 返回键名本身，所以按 key 定位行。
+  // 行结构：children[0] 是标签 div，children[1] 是结论，children[2] 是档位明细。
+  const reasoningRow = (info) =>
+    nodes(base, catalogOf(), info).find((n) => n.children?.[0]?.children?.[0] === "settings.reasoning");
+  assert.equal(reasoningRow(null), undefined, "without a probe result the row stays hidden");
+  const conclusion = (info) => reasoningRow(info).children[1].children[0];
+  const detail = (info) => reasoningRow(info).children[2]?.children[0] ?? "";
+  assert.equal(
+    conclusion({ known: false }),
+    "settings.reasoningUnknown",
+    "an unreadable model says so instead of claiming reasoning is off"
+  );
+  assert.equal(
+    conclusion({ known: true, efforts: [], effort: null }),
+    "settings.reasoningNone",
+    "a model with no efforts is reported as a non-reasoning model"
+  );
+  // 关闭推理的说法只认 host 给的 `off` 结论：档位 id 在不同网关叫法不一
+  //（off / none），界面自己认 id 迟早和 host 对不上。
+  assert.equal(
+    conclusion({ known: true, efforts: ["off", "low"], effort: "off", off: true }),
+    "settings.reasoningOff",
+    "a model that really turned reasoning off is reported as off"
+  );
+  assert.equal(
+    conclusion({ known: true, efforts: ["none", "low"], effort: "none", off: true }),
+    "settings.reasoningOff",
+    "the same verdict under a differently named id still reads as off"
+  );
+  assert.equal(
+    conclusion({ known: true, efforts: ["low"], effort: "low" }),
+    "settings.reasoningLow" + "low",
+    "without the verdict the panel never claims reasoning is off"
+  );
+  // 反过来也必须成立：host 说没关掉（off:false），界面就不许靠档位 id 自己判断。
+  // 关闭档的名单只该有一份，在 host 那边。
+  assert.equal(
+    conclusion({ known: true, efforts: ["off", "low"], effort: "off", off: false }),
+    "settings.reasoningLow" + "off",
+    "the panel follows the host verdict, not the effort id"
+  );
+  const fallbackInfo = {
+    known: true,
+    efforts: ["low", "high", "max"],
+    defaultEffort: "high",
+    effort: "low",
+    maxOutputTokens: 4096
+  };
+  assert.equal(
+    conclusion(fallbackInfo),
+    "settings.reasoningLow" + "low",
+    "a model without off is reported as its lowest effort"
+  );
+  assert.match(detail(fallbackInfo), /low \/ high \/ max/, "the available efforts are listed");
+  assert.match(detail(fallbackInfo), /settings\.reasoningDefault\s*high/, "the model default is listed");
+  assert.match(detail(fallbackInfo), /settings\.reasoningBudget\s*4096/, "the effective output limit is listed too");
+
+  // 8b. 用户指定过档位：说的是「按你说的来」，不是「我们替你挑了哪个」。
+  //     指定了但模型没有这一档（换模型后残留的旧配置）必须明说回退了，
+  //     否则用户会以为生效了，而实际发的是另一个档位。
+  assert.equal(
+    conclusion({ known: true, efforts: ["low", "high"], requested: "high", effort: "high" }),
+    "settings.reasoningPicked" + "high",
+    "an honored explicit effort is reported as sent"
+  );
+  assert.equal(
+    conclusion({ known: true, efforts: ["low", "high"], requested: "max", effort: "low" }),
+    "settings.reasoningFallback" + "max → low",
+    "an unavailable explicit effort is reported as a fallback, with both ends named"
+  );
+
+  // 8c. 档位下拉：选项只能是「自动 + 模型自己声明的档位」。
+  //     有的网关对未知档位不报错、直接忽略（实测收到没声明的档位也照样思考），
+  //     所以绝不能给一个自由输入框，让人以为自己选了个生效的值。
+  const selectOf = (info) => nodes(base, catalogOf(), info).find((n) => n.type === "select");
+  assert.equal(selectOf(null), undefined, "no probe result → no dropdown");
+  assert.equal(
+    selectOf({ known: true, efforts: [], effort: null }),
+    undefined,
+    "a non-reasoning model gets no dropdown either"
+  );
+  const reasoningSelect = selectOf(fallbackInfo);
+  assert.ok(reasoningSelect, "a model with efforts offers a dropdown");
+  assert.deepEqual(
+    flat(reasoningSelect).map((option) => option.props?.value),
+    ["auto", "low", "high", "max"],
+    "auto comes first, then exactly the model's own efforts"
+  );
+  assert.equal(reasoningSelect.props.value, "auto", "an unset draft shows as auto");
+  reasoningSelect.props.onChange({ target: { value: "high" } });
+  assert.deepEqual(edited.at(-1), ["reasoningEffort", "high"], "picking an effort reports it upward as a draft edit");
+
+  // 8d. 换模型后草稿里残留的旧档位不能显示。它不在新模型的 options 里，
+  //     浏览器会渲染成空白而草稿仍是旧值 —— 界面显示一个「已选中的陌生档位」，
+  //     保存时还会把它发给 host（host 侧 pickReasoningEffort 才兜底回退）。
+  //     显示层必须先回退成 auto。
+  const staleEffort = nodes(base, catalogOf(), fallbackInfo, { ...base.draft, reasoningEffort: "medium" })
+    .find((n) => n.type === "select");
+  assert.equal(staleEffort.props.value, "auto", "an effort the new model does not declare shows as auto, not as a stale gap");
+  // 模型自己声明的档位仍然照显示，不做多余回退。
+  const ownEffort = nodes(base, catalogOf(), fallbackInfo, { ...base.draft, reasoningEffort: "high" })
+    .find((n) => n.type === "select");
+  assert.equal(ownEffort.props.value, "high", "an effort the model declares still shows as picked");
+
+  // 8e. 数字行的 hint 必须带上 schema 范围：输入框没有 min/max/step 可摆，
+  //     越界值发给 host 只会被 schemastery 拒成「保存失败」，用户看不出是超范围。
+  //     范围写进 hint 是懒解，但至少把边界说清楚了。
+  //     假 locale 的 t() 返回键名，所以这里直接查导出字典（中英两张都查：
+  //     只改一张的话另一半语言的用户看不到范围）。
+  const dictionaries = exports.__test.dictionaries;
+  for (const [key, range] of [
+    ["settings.countHint", /1[–-]5/],
+    ["settings.tokensHint", /8[–-]4096/],
+    ["settings.timeoutHint", /1000[–-]600000/],
+    ["settings.cjkHint", /1[–-]400/]
+  ]) {
+    assert.match(dictionaries.zh[key], range, `zh ${key} states its accepted range`);
+    assert.match(dictionaries.en[key], range, `en ${key} states its accepted range`);
+  }
 
   // 搜索：目录够大时给一行搜索框，且它靠 CSS order:-1 提到列表最前
   //（P.Menu 把 children 渲染在 items 之后）。
@@ -982,6 +1129,76 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   );
 }
 
+// ---- 3a2. 换模型必须重新探测：档位说明、档位下拉、输出上限全跟着模型走 ----
+// 这条守住真实故障：reasoningStore 只在打开面板时写一次，用户在面板里换模型后
+// 那三样都停留在上一个模型的值 —— 用户看到「换个模型，推理说明没变」。
+// editSetting 是 HeaderAction 里的闭包，模块作用域拿不到，所以渲染一次入口后
+// 从组件上把它取下来（exports.__test.HeaderAction.__testEditSetting）。
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
+  renderButton(slots.of(HEADER)[0].component, { sessionId: "s1" });
+  const HeaderAction = exports.__test.HeaderAction;
+  assert.equal(typeof HeaderAction.__testEditSetting, "function", "the header action exposes its edit handler for testing");
+  const editSetting = HeaderAction.__testEditSetting;
+  const saveSettings = HeaderAction.__testSaveSettings;
+  const loadSettings = HeaderAction.__testLoadSettings;
+
+  const http = captureFetch([], { configValue: { reasoning: { known: true, efforts: ["low"], effort: "low", maxOutputTokens: 4096 } } });
+  try {
+    // 只换 model 也要探测：provider 不变时 route 照样是新的。
+    editSetting("model", "draft-model");
+    const probes = http.calls.filter((call) => call.url.endsWith("/config"));
+    assert.deepEqual(
+      probes.map((call) => call.body),
+      [{ provider: "", model: "draft-model" }],
+      "a model change re-probes with the draft route, not the effective one"
+    );
+    // 探测失败不能掀桌：面板还得能用，reasoning 保持上一次的报告。
+    http.failNext = true;
+    editSetting("provider", "provider-b");
+    assert.ok(true, "a failed re-probe must not throw");
+  } finally {
+    http.restore();
+  }
+
+  // 档位复位必须用「保存时真发出去的 patch」验：Zhlint 显示成 auto 是够的，
+  // 但草稿留着旧档位的话保存照样发出去 —— host 静默回退，界面显示一档、
+  // 实际跑另一档。替身里草稿不会 re-render，patch 是唯一可观测面。
+  // 先把草稿摆成「刚加载完、带一个旧档位」，再换模型，然后看 save 的 body。
+  const seeded = captureFetch([], {
+    configValue: {
+      autoRenameEnabled: true,
+      suggestionCount: 3,
+      maxOutputTokens: 256,
+      timeoutMs: 60000,
+      targetCjkCharacters: 12,
+      route: { provider: "acme", model: "nested/main" },
+      reasoningEffort: "medium",
+      reasoning: { known: true, efforts: ["low", "high"], effort: "high", maxOutputTokens: 2048 }
+    }
+  });
+  try {
+    await loadSettings();
+    await new Promise((resolve) => setImmediate(resolve));
+    editSetting("model", "nested/main");
+    await saveSettings();
+    const saved = seeded.calls.filter((c) => c.url.endsWith("/settings"));
+    assert.equal(saved.length, 1, "saving writes the draft once");
+    assert.equal(saved[0].body.reasoningEffort, "auto", "the model change resets the effort to auto, not the stale one");
+  } finally {
+    seeded.restore();
+  }
+
+  // 非模型字段不触发探测：每敲一个数字都去问一次 host 是浪费。
+  const quiet = captureFetch([]);
+  try {
+    editSetting("suggestionCount", "5");
+    assert.equal(quiet.calls.length, 0, "editing a plain field does not re-probe");
+  } finally {
+    quiet.restore();
+  }
+}
 // ---- 3b. apply 必须从 `remote.session` 服务取目录，而不是 `remote.session` 属性 ----
 // 这条守住真实故障：宿主 api-gateway 按 namespace 逐个注册服务（`remote.${ns}`），
 // `remote.session` 是**独立服务**。早期实现只 inject `remote` 再读 `remote.session`
@@ -1008,6 +1225,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     type: SettingsPanel,
     props: {
       store: settingsStore,
+      reasoningStore: dialog.props.reasoningStore,
       catalog: exports.__test.modelCatalog,
       onEdit: () => {},
       onSave: () => {}
@@ -1030,7 +1248,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   const menu = [panel, ...deep2(panel)].find((n) => n.type === "Menu");
   assert.ok(menu, "the picker renders");
   assert.ok(
-    menu.props.items.some((entry) => entry.id === JSON.stringify(["magpie", "group/never-stuck"])),
+    menu.props.items.some((entry) => entry.id === JSON.stringify(["acme", "nested/main"])),
     "the live catalog's models reach the picker, so the list is not empty"
   );
 }
