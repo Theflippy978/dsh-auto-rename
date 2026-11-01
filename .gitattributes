@@ -1,0 +1,17 @@
+# 统一换行：仓库里一律存 LF，checkout 出来也一律是 LF。
+#
+# 不加这段的话，本机 core.autocrlf=true 会把 lib/*.js 写成 CRLF，后果有两个：
+#   1. test/client-smoke.mjs 里按裸 LF 硬匹配源码的断言会 indexOf 到 -1，
+#      表现为 "opening the picker retries after a failure" 断言炸（看着像代码回归，
+#      其实只是换行）。
+#   2. npm pack 打出来的 tarball 变成 CRLF，与已发布的 0.2.0（LF）不一致，
+#      下次发布会掺进一堆无关的换行变更。
+* text=auto eol=lf
+
+# 二进制，不做任何换行处理
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
