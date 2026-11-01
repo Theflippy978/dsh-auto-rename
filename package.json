@@ -5,6 +5,7 @@
   "type": "module",
   "packageManager": "pnpm@11.7.0",
   "main": "lib/index.js",
+  "icon": "./icon.svg",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",

@@ -1,6 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="dsh-auto-rename">
-  <rect width="64" height="64" rx="14" fill="#ffffff" stroke="#0000001a" stroke-width="1"/>
-  <path d="M19.95 9.5C19.95 15.8 23.1 18.95 29.4 18.95C23.1 18.95 19.95 22.1 19.95 28.4C19.95 22.1 16.8 18.95 10.5 18.95C16.8 18.95 19.95 15.8 19.95 9.5Z" fill="none" stroke="#4176e6" stroke-width="2.4" stroke-linejoin="round"/>
-  <path d="M20.22 37.84L14 50L26.16 43.78L48.97 20.97L43.03 15.03Z" fill="none" stroke="#4176e6" stroke-width="2.8" stroke-linejoin="miter"/>
-  <path d="M20.22 37.84L26.16 43.78M38.43 19.63L44.37 25.57" fill="none" stroke="#4176e6" stroke-width="2.6" stroke-linecap="round"/>
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="11.5" y="8" width="17" height="14" rx="2.5" fill="#7CB7FF" fill-opacity="0.55" />
+  <path d="M10 12H23C24.3807 12 25.5 13.1193 25.5 14.5V23.5C25.5 24.8807 24.3807 26 23 26H14.5L10.4 30.1Q10 30.5 10 29.93V26C8.61929 26 7.5 24.8807 7.5 23.5V14.5C7.5 13.1193 8.61929 12 10 12Z" fill="url(#dsh-auto-rename-bubble)" />
+  <path d="M15 21L20.6 15.4L23 17.8L17.4 23.4Z" fill="#FFFFFF" />
+  <path d="M15 21L14 24.4L17.4 23.4Z" fill="#FFFFFF" fill-opacity="0.7" />
+  <defs>
+    <linearGradient id="dsh-auto-rename-bubble" x1="9" y1="12" x2="24" y2="28" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6FB2EE" />
+      <stop offset="1" stop-color="#3E58D6" />
+    </linearGradient>
+  </defs>
 </svg>
