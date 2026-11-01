@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { apply, Config, inject, name } from "../lib/index.js";
-import { REASONING_TOKEN_FLOOR, TITLE_ATTEMPTS } from "../lib/config.js";
+import { AUTO_EFFORT, DEFAULTS, REASONING_TOKEN_FLOOR, TITLE_ATTEMPTS } from "../lib/config.js";
 
 // ---- 假 ctx ----
 
@@ -132,6 +132,31 @@ assert.deepEqual(Object.keys(Config.dict), [
   "reasoningEffort"
 ], "the config schema must expose exactly the user-facing fields");
 
+// 每个字段都必须带 .default()。宿主配置页的「恢复默认」读的就是 schema 的
+// meta.default（base 层），缺了它 resetField 只会给出空串 —— 用户点一下，
+// 输入框被清空，看起来像「配置被删了」。默认值还必须与 DEFAULTS 一致，
+// 否则「恢复默认」给的数跟真正的兜底值不是同一个。
+{
+  const expectedDefaults = {
+    provider: "",
+    model: "",
+    targetCjkCharacters: DEFAULTS.targetCjkCharacters,
+    maxInputBytes: DEFAULTS.maxInputBytes,
+    maxOutputTokens: DEFAULTS.maxOutputTokens,
+    timeoutMs: DEFAULTS.timeoutMs,
+    suggestionCount: DEFAULTS.suggestionCount,
+    autoRenameEnabled: DEFAULTS.autoRenameEnabled,
+    reasoningEffort: AUTO_EFFORT
+  };
+  for (const [field, want] of Object.entries(expectedDefaults)) {
+    const schema = Config.dict[field];
+    assert.equal(schema.meta?.default, want, `${field} must declare a default so the host's reset button restores a value`);
+    // volatile 的语义是「这些字段变化不触发插件重载」，不是「不持久化」，
+    // 所以它能和 .default() 共存（官方 dsh-bash-local 就这么写）。
+    assert.equal(schema.meta?.volatile, true, `${field} stays volatile so a settings change never reloads the plugin`);
+  }
+}
+
 // ---- 2. 服务缺失时降级，不抛错 ----
 
 {
@@ -171,6 +196,26 @@ assert.deepEqual(Object.keys(Config.dict), [
     ]
   );
   assert.ok(routes.every((route) => typeof route.handler === "function"));
+}
+
+// ---- 3b. provider disposer 必须挂到本插件的 effect 上 ----
+// register() 返回的是 Cordis effect disposer，而它内部那个 effect 属于
+// session-title 服务 —— 插件自己卸载/重挂载时不会跑。不接的话旧 provider
+// 永久占着全局唯一名额（register 只接受一个），重挂载后新注册抛
+// already registered，自动命名静默失效直到重启宿主。
+{
+  const { ctx, services, effects } = makeCtx();
+  let disposed = 0;
+  services.set("sessionTitle", { register: () => () => { disposed++; } });
+  services.set("llm", {});
+  apply(ctx, {});
+
+  const entry = effects.find((item) => String(item.label).includes("title provider"));
+  assert.ok(entry, "the provider registration is wrapped in a ctx.effect");
+  assert.equal(typeof entry.dispose, "function", "the effect exposes the host's disposer");
+  assert.equal(disposed, 0, "nothing is disposed while the plugin stays loaded");
+  entry.dispose();
+  assert.equal(disposed, 1, "unloading the plugin releases the provider slot");
 }
 
 // ---- 4. provider.generate 走通全链路（session-title-llm 用 test/stubs 替身） ----
@@ -528,6 +573,30 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.deepEqual(res.body.value.reasoning.efforts, []);
   assert.equal(res.body.value.reasoning.maxOutputTokens, REASONING_TOKEN_FLOOR, "the reported budget matches what generate would use");
 
+  // 探测必须带超时。resolveModelInfo 要问 adapter，adapter 卡住（网络、限流、
+  // 进程没起）时没有超时的话，这条 HTTP 请求就永远不返回 —— 设置面板一直转圈，
+  // 用户只能重启。5 秒预算只是上限，正常探测几十毫秒就回来了。
+  {
+    const probeCtx = makeCtx();
+    const probeRoutes = [];
+    let seenSignal;
+    probeCtx.services.set("sessionTitle", { register: () => () => {} });
+    probeCtx.services.set("llm", {
+      resolveModelInfo: async (provider, model, signal) => {
+        seenSignal = signal;
+        return { reasoning: { efforts: [{ id: "low" }] } };
+      }
+    });
+    probeCtx.services.set("sessions", { get: () => undefined });
+    probeCtx.services.set("webServer", makeWebServer(probeRoutes));
+    apply(probeCtx.ctx, { provider: "acme", model: "nested/main" });
+    const probeRes = makeRes();
+    await probeRoutes.find((r) => r.path === "/dsh-auto-rename/config").handler(makeReq({}), probeRes);
+    assert.equal(probeRes.status, 200);
+    assert.ok(seenSignal instanceof AbortSignal, "the capability probe carries an AbortSignal");
+    assert.equal(seenSignal.aborted, false, "the probe budget is not already expired when it starts");
+  }
+
   // 显式成对配置 → route 回显
   {
     const second = makeCtx();
@@ -746,7 +815,11 @@ assert.deepEqual(Object.keys(Config.dict), [
   services.set("llm", {});
   services.set("sessions", { get: () => undefined });
   services.set("webServer", makeWebServer(routes));
-  services.set("settings", { update: async (ns, patch) => updates.push({ ns, patch }) });
+  const mutations = [];
+  services.set("settings", {
+    update: async (ns, patch) => updates.push({ ns, patch }),
+    mutate: async (ns, ops) => mutations.push({ ns, ops })
+  });
   apply(ctx, {});
   const settingsRoute = routes.find((r) => r.path === "/dsh-auto-rename/settings");
 
@@ -782,11 +855,38 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.match(res.body.error, /no writable field/);
   assert.equal(updates.length, 2, "nothing was written for the rejected request");
 
-  // 空字符串的 provider/model 表示「清空 = 跟随主模型」，必须原样传下去（undefined 让宿主删键）。
+  // 空字符串的 provider/model 表示「清空 = 跟随主模型」。
+  // ⚠️ 绝不能用 `{ provider: undefined }` 传：宿主 settings.update 的入参先过
+  // cloneJsonShaped，它明确剥掉 undefined 条目，而 mergeLayers 只合并不删除 ——
+  // 那样界面显示「已保存」，值根本没动。清空只能走 mutate 的 {op:"unset"}。
   res = makeRes();
   await settingsRoute.handler(makeReq({ provider: "", model: "  " }), res);
   assert.equal(res.status, 200);
-  assert.deepEqual(updates[2].patch, { provider: undefined, model: undefined }, "blank route fields clear the override");
+  assert.equal(updates.length, 2, "a clear must not go through update(), which strips undefined");
+  assert.equal(mutations.length, 1, "a clear goes through mutate()");
+  assert.equal(mutations[0].ns, "dsh-auto-rename");
+  assert.deepEqual(
+    mutations[0].ops,
+    [
+      { op: "unset", path: ["provider"] },
+      { op: "unset", path: ["model"] }
+    ],
+    "blank route fields clear the override through op:unset"
+  );
+
+  // 混写：有值走 set、空值走 unset，一次 mutate 里按顺序提交。
+  res = makeRes();
+  await settingsRoute.handler(makeReq({ provider: "acme", model: "", timeoutMs: 30000 }), res);
+  assert.equal(res.status, 200);
+  assert.deepEqual(
+    mutations[1].ops,
+    [
+      { op: "set", path: ["timeoutMs"], value: 30000 },
+      { op: "set", path: ["provider"], value: "acme" },
+      { op: "unset", path: ["model"] }
+    ],
+    "set and unset ride the same mutate batch"
+  );
 
   // settings 服务缺席 → 503，不能假装保存成功。
   const bare = makeCtx();
