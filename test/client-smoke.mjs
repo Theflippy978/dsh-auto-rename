@@ -298,7 +298,21 @@ function makeConfigForms(behaviour = {}) {
     scope,
     get: (ns) => {
       assert.equal(ns, "dsh-auto-rename", "the form is bound to this plugin's namespace");
+      // 宿主没为本插件注册 Config schema 时 get() 给空 —— 卡片必须只是缺席。
+      if (behaviour.missingScope) return undefined;
       return scope;
+    },
+    /**
+     * 与官方 ConfigForms.whileServed 同签名：命名空间被宿主服务时立刻调
+     * register(served)，返回的 disposer 负责收尾。
+     * `notServed` 模拟「宿主没服务这个命名空间」—— 那时 register 不该被调用，
+     * 插件页里也不该留下本插件的痕迹（官方 ui-settings-shell 与
+     * @wenaixi/dsh-ponytail 都是同一生命周期协议）。
+     */
+    whileServed(namespaces, register) {
+      assert.deepEqual(namespaces, ["dsh-auto-rename"], "the card follows this plugin's own namespace");
+      if (behaviour.notServed) return () => {};
+      return register(new Set(namespaces));
     }
   };
 }
@@ -530,11 +544,12 @@ function makeRemote(behaviour = {}) {
 }
 
 const HEADER = "conversation.session.header.actions";
-// 官方自己的设置页（settings-web-search / -subagent / -agent-loop）都注册到
-// plugins.item（带 id+label，在插件页里作为一个可点条目）。不用 plugins.bundle.config：
-// 那是 keyed 槽，插件管理器按 ledger.bundles.has(pkg.name) 决定详情页里渲不渲染配置区，
-// 而 ledger 又来自该槽位已注册的 key —— 注册没进去就永远不渲染。
-const CARD = "plugins.item";
+// 第三方插件走 plugins.bundle.config：keyed 槽，**key 取 bundle 包名**，渲染在该
+// bundle 自己的详情页里。@wenaixi/dsh-ponytail（key: "@wenaixi/dsh-ponytail"）与官方
+// dsh-experimental-client-ui-cot-translation / -voice-input 都是这个形态。
+// plugins.item 是插件页顶部「内置插件配置」区的列表条目，官方自己那四个 settings-*
+// 页用它是为了挤在同一块「内置」区里 —— 第三方插件混进去不规范（用户实测反馈）。
+const CARD = "plugins.bundle.config";
 
 /** 等目录的 promise 链跑完（loadCatalog 是异步的）。 */
 async function flush() {
@@ -760,19 +775,75 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(gear.props["aria-label"], "settings.show", "the collapsed gear names the action");
 }
 
-// ---- 3. 设置面板：自绘在「AI 命名」弹窗里，不依赖宿主插槽 ----
+// ---- 3. 设置页：注册到 bundle 自己的配置槽（第三方插件标准做法） ----
 {
   const slots = makeSlots();
   await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
 
-  // 关键契约：不再向宿主的设置槽位注册任何东西。
-  // 历史教训——注册到 plugins.bundle.config / plugins.item 都试过，
-  // 注册代码走通了但真实界面不渲染，且失败是静默的。改成弹窗内自绘后，
-  // 这条断言守住「不要再接回宿主插槽」。
-  assert.equal(slots.of("plugins.item").length, 0, "no settings page is registered into the host's slots any more");
-  assert.equal(slots.of("plugins.bundle.config").length, 0, "nor into the keyed bundle-config slot");
-  assert.equal(slots.of(HEADER).length, 1, "the header entry is still the one host slot we use");
+  // 关键契约：设置页真的注册进宿主槽位了。
+  // 曾经这里是「注册代码走通、真实界面不渲染」，根因**不在宿主**：installSettingsCard
+  // 第一行读的是 `ctx.inject`，而受限 facade 的 CTX_VERBS 里根本没有 inject，读它
+  // 直接抛错 —— 整段在真实环境里第一行就退出了，一个 entry 都没注册过。
+  // 现在取服务走 ctx.get，这条断言守住「真的注册进去了」。
+  const cards = slots.of(CARD);
+  assert.equal(cards.length, 1, "the settings page registers into the bundle's own config slot");
+  assert.equal(
+    cards[0].options.key,
+    "dsh-auto-rename",
+    "the key is the bundle package name the plugin manager matches pkg.name against"
+  );
+  assert.equal(cards[0].options.locale, "dsh-auto-rename");
+  assert.equal(typeof cards[0].options.inject, "function", "the face is built lazily per registration");
+  assert.equal(slots.of("plugins.item").length, 0, "we stay out of the official 'built-in plugins' area");
+  assert.equal(slots.of(HEADER).length, 1, "the header entry still registers alongside it");
+}
 
+// ---- 3a. 宿主没服务这个命名空间：整块不出现（官方 shell / ponytail 同一协议） ----
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms({ notServed: true })));
+  assert.equal(slots.of(CARD).length, 0, "an unserved namespace leaves no trace of the config card");
+  assert.equal(slots.of(HEADER).length, 1, "and the header entry is unaffected");
+}
+
+// ---- 3b. configForms 缺席：卡片静默缺席，顶部入口照常 ----
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), undefined));
+  assert.equal(slots.of(CARD).length, 0, "without configForms the settings card is simply absent");
+  assert.equal(slots.of(HEADER).length, 1, "and the header entry is unaffected");
+}
+
+// ---- 3b2. 宿主没为本插件注册 Config schema：同样只是卡片缺席，不炸 ----
+// 这条守的是「configForms.get(NS) 返回空时 new SettingsFormModel(undefined) 抛错，
+// 把整个 client 半边一起带走」—— 那会让顶部主入口也消失。
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms({ missingScope: true })));
+  assert.equal(slots.of(CARD).length, 0, "an unregistered Config schema leaves the card absent");
+  assert.equal(slots.of(HEADER).length, 1, "and the header entry still registers");
+}
+
+// ---- 3c. 注册成功 ≠ 渲染成功：SettingsCard 必须真能渲染出来 ----
+// 渲染期抛错会被宿主的 SlotErrorBoundary 吞掉并静默 abdicate —— entry 直接从槽里
+// 消失，用户看到的就是「插件页没有这张卡片」，没有任何报错。所以这一条不能省：
+// 注册对了但组件坏了，症状与「没注册」一模一样。
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
+  const card = slots.of(CARD)[0];
+  assert.ok(card, "precondition: the card is registered");
+  const { tree } = renderEntry(card, { view: "settings" });
+  assert.ok(tree, "the settings card renders without throwing");
+  assert.equal(typeof tree.type, "string", "it renders a host primitive, not a fragment");
+
+  // 列表里那一行只渲染 summary，必须给出一句纯文本而不是空节点。
+  const summary = renderEntry(card, { view: "summary" });
+  assert.equal(typeof summary.tree, "string", "the summary row is plain text");
+}
+
+// ---- 3c. 弹窗内自绘的设置面板：直接渲染，不依赖宿主槽位 ----
+{
   // 面板直接渲染（不走 React 状态流转：替身无法驱动 useState 的 set → re-render 循环，
   // 那条路径只会得到假通过）。settingsStore 由测试自己造，语义与 HeaderAction 里一致。
   const SettingsPanel = exports.__test.SettingsPanel;
