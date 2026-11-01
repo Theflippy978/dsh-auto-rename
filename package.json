@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-rename",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH 自动对话重命名：随对话自动刷新标题，并在重命名窗口提供 AI 建议",
   "type": "module",
   "packageManager": "pnpm@11.7.0",

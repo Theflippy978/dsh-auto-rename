@@ -8,7 +8,7 @@
 Titles name themselves, refresh as the conversation grows, and the rename dialog streams
 AI suggestions.
 
-[![version](https://img.shields.io/badge/version-0.2.0-4176e6)](package.json)
+[![version](https://img.shields.io/badge/version-0.2.1-4176e6)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-4176e6)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-0.2.1--rc.2-6b7280)](#known-limits)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.19-6b7280)](package.json)

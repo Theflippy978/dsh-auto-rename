@@ -7,7 +7,7 @@
 **DeepSeek Harness 的对话自动命名。**
 自动定名、随对话刷新，重命名弹窗流式给出 AI 建议。
 
-[![版本](https://img.shields.io/badge/版本-0.2.0-4176e6)](package.json)
+[![版本](https://img.shields.io/badge/版本-0.2.1-4176e6)](package.json)
 [![许可](https://img.shields.io/badge/许可-MIT-4176e6)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-0.2.1--rc.2-6b7280)](#已知边界)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.19-6b7280)](package.json)
