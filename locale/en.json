@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "AI Conversation Naming",
-    "description": "Refreshes the title as the conversation grows and streams AI title suggestions into the rename dialog; the naming model is picked from the Host's authenticated catalog, or follows the conversation's main model."
+    "description": "Refreshes the title as the conversation grows and streams AI title suggestions into the rename dialog; the naming model is picked from the Host's authenticated catalog, or follows the conversation's main model.",
+    "detail": "docs/DETAIL.md"
   }
 }

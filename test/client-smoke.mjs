@@ -450,7 +450,9 @@ function renderEntry(entry, extraProps = {}) {
   }
   const { hooks, ...actions } = face;
   Object.assign(props, actions);
-  return { props, tree: entry.component(props) };
+  // 走 renderComponent（hook 夹具）：设置卡片自己也有 useState（折叠状态），
+  // 绕过夹具会让「React hook rendered outside renderComponent」把渲染打炸。
+  return { props, tree: renderComponent(entry.component, props) };
 }
 
 /**
@@ -466,7 +468,7 @@ function renderEntry(entry, extraProps = {}) {
  * ⚠️ **`remote.session` 必须注册成独立服务**：宿主 api-gateway 按 namespace 逐个
  * 注册，`remoteServiceKey(ns)` 返回 `remote.${ns}`（源码实证），所以它**不是**
  * `remote` 的属性。早期替身写成 `remote = { session: {...} }`，正好掩盖了
- * 「只 inject remote、读 remote.session」这个真实 bug（用户实测读不到模型目录）。
+ * 「只 inject remote、读 remote.session」这个真实 bug（嵌套形状下目录读不到）。
  * 别再改回嵌套形状。
  */
 /**
@@ -482,7 +484,7 @@ function renderEntry(entry, extraProps = {}) {
  * ⚠️ **`remote.session` 必须注册成独立服务**：宿主 api-gateway 按 namespace 逐个
  * 注册，`remoteServiceKey(ns)` 返回 `remote.${ns}`（源码实证），所以它**不是**
  * `remote` 的属性。早期替身写成 `remote = { session: {...} }`，正好掩盖了
- * 「读 remote.session 属性」这个真实 bug（用户实测读不到模型目录）。别再改回嵌套形状。
+ * 「读 remote.session 属性」这个真实 bug（嵌套形状下目录读不到）。别再改回嵌套形状。
  *
  * ⚠️ **`ctx.inject` 在真实 facade 上根本不存在**，读它**抛错**（不是 undefined）——
  * runner 的 `dynamicCordisContext` 是个只暴露 `get` + CTX_VERBS 的 Proxy。
@@ -548,7 +550,7 @@ const HEADER = "conversation.session.header.actions";
 // bundle 自己的详情页里。@wenaixi/dsh-ponytail（key: "@wenaixi/dsh-ponytail"）与官方
 // dsh-experimental-client-ui-cot-translation / -voice-input 都是这个形态。
 // plugins.item 是插件页顶部「内置插件配置」区的列表条目，官方自己那四个 settings-*
-// 页用它是为了挤在同一块「内置」区里 —— 第三方插件混进去不规范（用户实测反馈）。
+// 页用它是为了挤在同一块「内置」区里 —— 第三方插件混进去会与官方设置页混排，层级不对。
 const CARD = "plugins.bundle.config";
 
 /** 等目录的 promise 链跑完（loadCatalog 是异步的）。 */
@@ -722,7 +724,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.deepEqual(titles, ["拆开的建议"], "a line split across chunks is reassembled, not dropped");
 }
 
-// ---- 2d. 弹窗限高 + 设置图标：两处都是「渲染形态」契约，静默失效就退回用户报的故障 ----
+// ---- 2d. 弹窗限高 + 设置图标：两处都是「渲染形态」契约，静默失效就退回溢出/裁切故障 ----
 {
   const slots = makeSlots();
   await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
@@ -732,7 +734,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(styleTags.length, 1, "the dialog stylesheet is injected exactly once");
   const css = styleTags[0].textContent;
   // 根因断言：宿主 .dialog 自己不设 max-height（官方注释要求调用方 cap growth），
-  // 我们不传就是「整个弹窗上下超出屏幕、标题和底部被裁掉」——用户实测症状。
+  // 我们不传就是「整个弹窗上下超出屏幕、标题和底部被裁掉」。
   assert.match(css, /\.dsh-auto-rename-dialog\{max-height:100%\}/, "the dialog caps its height");
   // 滚动必须落在 .body（content 的最后一个子元素），**不能**开在 .content 上。
   // Edge headless 实测：开在 content 上时滚动条挤压 header 宽度，把关闭键往左推，
@@ -826,7 +828,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
 // ---- 3c. 注册成功 ≠ 渲染成功：SettingsCard 必须真能渲染出来 ----
 // 渲染期抛错会被宿主的 SlotErrorBoundary 吞掉并静默 abdicate —— entry 直接从槽里
-// 消失，用户看到的就是「插件页没有这张卡片」，没有任何报错。所以这一条不能省：
+// 消失，插件页就是没有这张卡片，且没有任何报错。所以这一条不能省：
 // 注册对了但组件坏了，症状与「没注册」一模一样。
 {
   const slots = makeSlots();
@@ -835,7 +837,27 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.ok(card, "precondition: the card is registered");
   const { tree } = renderEntry(card, { view: "settings" });
   assert.ok(tree, "the settings card renders without throwing");
-  assert.equal(typeof tree.type, "string", "it renders a host primitive, not a fragment");
+  assert.equal(tree.type, "section", "the settings area is one collapsible card");
+
+  // 详情页已渲染整份 README，卡片默认收起，避免设置表单把页面再拖长一屏。
+  const [head, body] = tree.children;
+  assert.equal(head.type, "button", "the card header is a real button");
+  assert.equal(head.props["aria-expanded"], false, "collapsed by default");
+  assert.equal(body, null, "the form is not mounted while collapsed");
+  assert.equal(head.props["aria-controls"], "dsh-auto-rename-settings-card-body", "aria-controls points at the body id");
+  const title = head.children.find((child) => child.type === "span" && child.props.style?.fontWeight === 500);
+  assert.equal(title.children[0], "settings.title", "the header shows the settings title");
+
+  // 点一下展开：body 挂载 SettingsForm；再点一下收回。useState 替身按实例持久，
+  // 所以这条真的在驱动状态流转，不是摆拍。
+  head.props.onClick();
+  const opened = renderEntry(card, { view: "settings" }).tree.children[1];
+  assert.ok(opened, "the body mounts after one click");
+  assert.equal(opened.props.id, head.props["aria-controls"], "aria-controls points at the body");
+  const form = opened.children.find((child) => child.type === "SettingsForm");
+  assert.ok(form, "the body wraps the host SettingsForm");
+  head.props.onClick();
+  assert.equal(renderEntry(card, { view: "settings" }).tree.children[1], null, "collapses again on the second click");
 
   // 列表里那一行只渲染 summary，必须给出一句纯文本而不是空节点。
   const summary = renderEntry(card, { view: "summary" });
@@ -992,7 +1014,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   }
 
   // 7. 命名模型：两个**只读**框显示当前选择 + 图标按钮打开宿主已认证模型下拉。
-  //    这是用户 2026-10-15 纠正的核心 —— 上一版退化成手填 provider/model，
+  //    上一版退化成手填 provider/model，
   //    手填错一个字符就变成「配置半对」，要到第一次自动命名才报错。
   const pair = nodes().filter(
     (n) => n.type === "input" && ["settings.provider", "settings.modelName"].includes(n.props["aria-label"])
@@ -1202,7 +1224,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
 // ---- 3a2. 换模型必须重新探测：档位说明、档位下拉、输出上限全跟着模型走 ----
 // 这条守住真实故障：reasoningStore 只在打开面板时写一次，用户在面板里换模型后
-// 那三样都停留在上一个模型的值 —— 用户看到「换个模型，推理说明没变」。
+// 那三样都停留在上一个模型的值 —— 面板显示与实际发送的档位不一致。
 // editSetting 是 HeaderAction 里的闭包，模块作用域拿不到，所以渲染一次入口后
 // 从组件上把它取下来（exports.__test.HeaderAction.__testEditSetting）。
 {
@@ -1273,7 +1295,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 // ---- 3b. apply 必须从 `remote.session` 服务取目录，而不是 `remote.session` 属性 ----
 // 这条守住真实故障：宿主 api-gateway 按 namespace 逐个注册服务（`remote.${ns}`），
 // `remote.session` 是**独立服务**。早期实现只 inject `remote` 再读 `remote.session`
-// 属性，恒为 undefined —— 目录永远读不到，用户看到「读不到宿主已认证的模型」。
+// 属性，恒为 undefined —— 目录永远读不到，模型一栏空置。
 {
   const slots = makeSlots();
   const session = makeRemote();
@@ -1369,7 +1391,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   );
 }
 
-// ---- 3e. 两个只读框的标签不许带「命名」前缀（用户 2026-10-16 明确要求删掉） ----
+// ---- 3e. 两个只读框的标签不带「命名」前缀 —— 小节标题已是「AI 命名模型」，前缀重复 ----
 {
   const zh = exports.__test.dictionaries?.zh ?? null;
   assert.ok(zh, "the Chinese dictionary is exposed for auditing");

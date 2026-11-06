@@ -90,7 +90,7 @@ assert.equal(overridden.maxOutputTokens, DEFAULTS.maxOutputTokens);
 assert.equal(resolveConfig({ suggestionCount: undefined }).suggestionCount, DEFAULTS.suggestionCount);
 
 // ---- targetWords 是派生值，不是用户旋钮 ----
-// 用户口径：英文不设词数上限，只受「中文 12 字」换算出的显示宽度约束。
+// 英文不设词数上限，只受「中文 12 字」换算出的显示宽度约束。
 // 但官方提示词要求它是正整数，所以从宽度预算折算：
 // 预算 = 字数 × 2 个半角单位，一个英文词按 6 单位估。
 assert.equal(resolveConfig().targetWords, 4, "12 CJK -> 24 units -> 4 words");
@@ -225,7 +225,7 @@ assert.equal(
 // ---- clampTitle：官方完全不截，长度只能自己守 ----
 // 口径是显示宽度（半角单位）：中日韩字算 2，其余含空格算 1。
 // 预算 = 中文字数上限 × 2，所以「中文 12 字」与「英文 24 字符（含空格）」等宽，
-// 不必再为英文单设一个数（用户 2026-10-14 的口径）。
+// 不必再为英文单设一个数。
 
 assert.equal(titleWidthUnits(12), 24, "12 CJK chars budget 24 half-width units");
 assert.equal(clampTitle("代码改动审阅与大量提问", 12), "代码改动审阅与大量提问", "11 CJK = 22 units, inside the 24 budget");
@@ -248,7 +248,7 @@ assert.equal(clampTitle("", 12), "");
 assert.equal(clampTitle(undefined, 12), undefined);
 
 // ---- 推理档位：关得掉就关，关不掉退最低档，非推理模型不传 ----
-// 用户四项要求的第 1、2 条全落在这一个函数里。选错的症状是「命名悄悄多花几秒
+// 档位语义的实现全落在这一个函数里。选错的症状是「命名悄悄多花几秒
 // 且偶尔超长失败」，不报错，所以必须由断言守住。
 {
   const efforts = (...ids) => ({ reasoning: { efforts: ids.map((id) => ({ id, name: id })) } });
