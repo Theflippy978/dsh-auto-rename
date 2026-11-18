@@ -133,7 +133,7 @@ assert.deepEqual(Object.keys(Config.dict), [
 ], "the config schema must expose exactly the user-facing fields");
 
 // 每个字段都必须带 .default()。宿主配置页的「恢复默认」读的就是 schema 的
-// meta.default（base 层），缺了它 resetField 只会给出空串 —— 用户点一下，
+// meta.default（base 层），缺了它 resetField 只会给出空串 —— 点一下，
 // 输入框被清空，看起来像「配置被删了」。默认值还必须与 DEFAULTS 一致，
 // 否则「恢复默认」给的数跟真正的兜底值不是同一个。
 {
@@ -468,6 +468,94 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.equal(cancelledCalls, 1, "cancellation stops after the first attempt");
 }
 
+// ---- 4e. 超长标题先让模型缩短一次；失败或仍超长则回落 clampTitle ----
+// 模型第一次输出常常超过预算，clampTitle 硬切会丢后半句/切坏词。缩短重试
+// 让模型保语义压到预算内；它失败（空/取消/超时/原样返回/仍超）都不能把
+// 一次本已成功的命名弄挂——必须拿第一次的 clampTitle 结果兜底。
+{
+  const run = async (responses, config = {}) => {
+    const { ctx, services } = makeCtx();
+    const registered = [];
+    services.set("sessionTitle", { register: (p) => registered.push(p) });
+    services.set("llm", {});
+    services.set("sessions", { get: () => undefined });
+    services.set("webServer", makeWebServer([]));
+    let calls = 0;
+    const seenSystems = [];
+    ctx.__testTitleGeneration = ({ prepared }) => {
+      seenSystems.push(prepared.system);
+      const next = responses[Math.min(calls, responses.length - 1)];
+      calls++;
+      return next;
+    };
+    apply(ctx, { provider: "acme", model: "test-model", targetCjkCharacters: 4, ...config });
+    const result = await registered[0].generate({
+      session: {},
+      messages: [{ seq: 1, text: "hi" }],
+      signal: AbortSignal.timeout(5000)
+    });
+    return { calls, result, seenSystems };
+  };
+  const long = { blocks: [{ type: "text", text: "一二三四五六七八" }], finish: { kind: "stop" }, model: { provider: "acme", model: "m" } };
+  const short = { blocks: [{ type: "text", text: "短标题" }], finish: { kind: "stop" }, model: { provider: "acme", model: "m" } };
+
+  // 第一次超长、第二次压到预算内 → 用缩短结果，恰好两次调用。
+  const improved = await run([long, short]);
+  assert.equal(improved.calls, 2, "an overlong title triggers exactly one shorten call");
+  assert.equal(improved.result.title, "短标题", "the shortened title is used");
+  // 第二次必须是缩短专用提示词，而不是又走一遍普通命名。
+  assert.ok(improved.seenSystems[1].includes("too long for the interface"), "the shorten prompt is sent on the retry");
+
+  // 缩短没改善（仍超长）→ 回落第一次的 clampTitle，且不第三次调用。
+  const stubborn = await run([long, long]);
+  assert.equal(stubborn.calls, 2, "no third call after a failed shortening");
+  assert.equal(stubborn.result.title, "一二三四", "clampTitle of the first result is the fallback");
+
+  // 缩短调用直接失败（空输出）→ 一样兜底，绝不把成功命名弄挂。
+  const failing = await run([long, { blocks: [], finish: { kind: "stop" }, model: {} }]);
+  assert.equal(failing.result.title, "一二三四", "a failed shorten call falls back to clampTitle");
+
+  // 本来就在预算内 → 不触发缩短，只调一次。
+  const fine = await run([short]);
+  assert.equal(fine.calls, 1, "an in-budget title needs no shorten call");
+}
+
+// ---- 4f. 稳定性规则：同话题保持原词，但换话题必须换标题 ----
+// 旧版把「materially change」门槛定太高，实测标题被钉死。这里用替身回显
+// prepared.system，断言新规则把「换话题要写新标题」说成明确指令。
+{
+  const { ctx, services } = makeCtx();
+  const registered = [];
+  services.set("sessionTitle", { register: (p) => registered.push(p) });
+  services.set("llm", {});
+  services.set("sessions", { get: () => undefined });
+  services.set("webServer", makeWebServer([]));
+  let seenSystem;
+  ctx.__testTitleGeneration = ({ prepared }) => {
+    seenSystem = prepared.system;
+    return { blocks: [{ type: "text", text: "新标题" }], finish: { kind: "stop" }, model: {} };
+  };
+  apply(ctx, { provider: "acme", model: "test-model" });
+  await registered[0].generate({
+    session: {},
+    messages: [{ seq: 1, text: "hi" }],
+    currentTitle: { title: "旧标题", source: { kind: "provider", provider: "dsh-auto-rename" } },
+    signal: AbortSignal.timeout(2000)
+  });
+  // 锚点被识别（source.kind === provider）→ 带上稳定性规则。
+  assert.ok(seenSystem.includes("introduce a different or expanded topic"), "a changed topic must be named explicitly");
+  assert.ok(seenSystem.includes("byte-for-byte"), "a still-fitting title is kept exactly");
+  // 兜底标题（source.kind === fallback）不算锚点，不能触发稳定性规则。
+  seenSystem = undefined;
+  await registered[0].generate({
+    session: {},
+    messages: [{ seq: 1, text: "hi" }],
+    currentTitle: { title: "首句截断", source: { kind: "fallback" } },
+    signal: AbortSignal.timeout(2000)
+  });
+  assert.ok(!seenSystem.includes("currentTitle"), "a fallback title is not an anchor");
+}
+
 // ---- 5. 关闭自动刷新 = 换节拍为 first-prompt，而不是拒绝命名 ----
 
 {
@@ -492,7 +580,7 @@ assert.deepEqual(Object.keys(Config.dict), [
 
   // 关掉之后 generate() 必须照常出 AI 标题：first-prompt 那一次排程是宿主在写
   // 兜底标题之前**同步**做的判断，所以这一次调用真的会发生。旧实现在这里抛错，
-  // 等于关掉就再没有 AI 命名、只剩首条消息截断 —— 那不是用户要的语义。
+  // 等于关掉就再没有 AI 命名、只剩首条消息截断 —— 那不符合所需语义。
   const titled = await provider.generate({
     session: {},
     messages: [{ seq: 1, text: "阅读文档完成接手" }],
@@ -575,7 +663,7 @@ assert.deepEqual(Object.keys(Config.dict), [
 
   // 探测必须带超时。resolveModelInfo 要问 adapter，adapter 卡住（网络、限流、
   // 进程没起）时没有超时的话，这条 HTTP 请求就永远不返回 —— 设置面板一直转圈，
-  // 用户只能重启。5 秒预算只是上限，正常探测几十毫秒就回来了。
+  // 只能重启。5 秒预算只是上限，正常探测几十毫秒就回来了。
   {
     const probeCtx = makeCtx();
     const probeRoutes = [];
@@ -611,7 +699,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   }
 
   // 6c. /config 的可选 route 覆盖：设置面板「换模型后立刻更新推理说明」用。
-  //     只读探测，绝不能改生效配置 —— 用户还没点保存，而自动命名随时可能触发。
+  //     只读探测，绝不能改生效配置 —— 尚未保存时，而自动命名随时可能触发。
   {
     const third = makeCtx();
     third.services.set("sessionTitle", { register: () => {} });

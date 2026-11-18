@@ -613,7 +613,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   ]);
   try {
     await button.props.onClick();
-    // 打开弹窗同时拉建议与当前配置（设置面板要立刻有值），两条都走我们自己的桥。
+    // 打开弹窗同时拉建议与当前配置（设置面板要立刻有值），两条都走本插件的 HTTP 桥。
     assert.deepEqual(
       http.calls.map((call) => call.url),
       ["/dsh-auto-rename/suggest", "/dsh-auto-rename/config"],
@@ -734,7 +734,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(styleTags.length, 1, "the dialog stylesheet is injected exactly once");
   const css = styleTags[0].textContent;
   // 根因断言：宿主 .dialog 自己不设 max-height（官方注释要求调用方 cap growth），
-  // 我们不传就是「整个弹窗上下超出屏幕、标题和底部被裁掉」。
+  // 省略该参数就是「整个弹窗上下超出屏幕、标题和底部被裁掉」。
   assert.match(css, /\.dsh-auto-rename-dialog\{max-height:100%\}/, "the dialog caps its height");
   // 滚动必须落在 .body（content 的最后一个子元素），**不能**开在 .content 上。
   // Edge headless 实测：开在 content 上时滚动条挤压 header 宽度，把关闭键往左推，
@@ -796,7 +796,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   );
   assert.equal(cards[0].options.locale, "dsh-auto-rename");
   assert.equal(typeof cards[0].options.inject, "function", "the face is built lazily per registration");
-  assert.equal(slots.of("plugins.item").length, 0, "we stay out of the official 'built-in plugins' area");
+  assert.equal(slots.of("plugins.item").length, 0, "the plugin stays out of the official 'built-in plugins' area");
   assert.equal(slots.of(HEADER).length, 1, "the header entry still registers alongside it");
 }
 
@@ -946,7 +946,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     nodes().some((n) => n.type === "Switch" && n.props.checked === true),
     "the boolean row reflects the live config"
   );
-  // 留空 = 跟随主模型，不是把字面量 "undefined" 显示给用户
+  // 留空 = 跟随主模型，不是把字面量 "undefined" 显示出来
   assert.ok(
     inputs.some((n) => n.props.value === "" && n.props["aria-label"] === "settings.provider"),
     "an unset provider renders as blank, not the string \"undefined\""
@@ -1078,7 +1078,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   menuWith.props.onSelect("follow");
   assert.deepEqual(edited.slice(-2), [["provider", ""], ["model", ""]], "following the main model clears the route");
 
-  // 当前值不在目录里也要显示出来，否则用户会以为配置丢了。
+  // 当前值不在目录里也要显示出来，否则会被误认为配置丢失。
   const stale = nodes({ ...base, draft: { ...base.draft, provider: "gone", model: "retired" } }, catalogOf({
     status: "ready",
     groups: [{ id: "acme", name: "Acme", models: [{ id: "nested/main", name: "nested" }] }]
@@ -1148,9 +1148,9 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.match(detail(fallbackInfo), /settings\.reasoningDefault\s*high/, "the model default is listed");
   assert.match(detail(fallbackInfo), /settings\.reasoningBudget\s*4096/, "the effective output limit is listed too");
 
-  // 8b. 用户指定过档位：说的是「按你说的来」，不是「我们替你挑了哪个」。
+  // 8b. 指定过档位：说的是「按配置执行」，不是「自动挑选」。
   //     指定了但模型没有这一档（换模型后残留的旧配置）必须明说回退了，
-  //     否则用户会以为生效了，而实际发的是另一个档位。
+  //     否则会被误认为已生效，而实际发的是另一个档位。
   assert.equal(
     conclusion({ known: true, efforts: ["low", "high"], requested: "high", effort: "high" }),
     "settings.reasoningPicked" + "high",
@@ -1196,10 +1196,10 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(ownEffort.props.value, "high", "an effort the model declares still shows as picked");
 
   // 8e. 数字行的 hint 必须带上 schema 范围：输入框没有 min/max/step 可摆，
-  //     越界值发给 host 只会被 schemastery 拒成「保存失败」，用户看不出是超范围。
+  //     越界值发给 host 只会被 schemastery 拒成「保存失败」，无法从界面看出是超范围。
   //     范围写进 hint 是懒解，但至少把边界说清楚了。
   //     假 locale 的 t() 返回键名，所以这里直接查导出字典（中英两张都查：
-  //     只改一张的话另一半语言的用户看不到范围）。
+  //     只改一张的话另一半语言看不到范围）。
   const dictionaries = exports.__test.dictionaries;
   for (const [key, range] of [
     ["settings.countHint", /1[–-]5/],
@@ -1223,7 +1223,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 }
 
 // ---- 3a2. 换模型必须重新探测：档位说明、档位下拉、输出上限全跟着模型走 ----
-// 这条守住真实故障：reasoningStore 只在打开面板时写一次，用户在面板里换模型后
+// 这条守住真实故障：reasoningStore 只在打开面板时写一次，在面板里换模型后
 // 那三样都停留在上一个模型的值 —— 面板显示与实际发送的档位不一致。
 // editSetting 是 HeaderAction 里的闭包，模块作用域拿不到，所以渲染一次入口后
 // 从组件上把它取下来（exports.__test.HeaderAction.__testEditSetting）。
@@ -1352,7 +1352,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 // 以及「服务缺席时 load() 会如实报 error 而不是假装空目录」。
 {
   const slots = makeSlots();
-  // 服务缺席时 load() 必须报 error：空列表会让用户以为「宿主没有模型」。
+  // 服务缺席时 load() 必须报 error：空列表会被误认为「宿主没有模型」。
   await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms(), undefined));
   await flush();
   const catalog = exports.__test.modelCatalog;

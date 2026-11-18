@@ -20,6 +20,9 @@ import {
   readVolatile,
   reasoningBudget,
   resolveConfig,
+  buildShortenPrompt,
+  frameShorten,
+  titleExceedsBudget,
   titleFromOutput,
   titleFromResponse,
   titleWidthUnits
@@ -89,12 +92,12 @@ assert.equal(overridden.maxOutputTokens, DEFAULTS.maxOutputTokens);
 // undefined 值不得覆盖默认（schemastery volatile 未设置时就是 undefined）
 assert.equal(resolveConfig({ suggestionCount: undefined }).suggestionCount, DEFAULTS.suggestionCount);
 
-// ---- targetWords 是派生值，不是用户旋钮 ----
+// ---- targetWords 是派生值，不是配置旋钮 ----
 // 英文不设词数上限，只受「中文 12 字」换算出的显示宽度约束。
 // 但官方提示词要求它是正整数，所以从宽度预算折算：
 // 预算 = 字数 × 2 个半角单位，一个英文词按 6 单位估。
 assert.equal(resolveConfig().targetWords, 4, "12 CJK -> 24 units -> 4 words");
-// 用户存过的 targetWords 必须被派生值覆盖，否则它又变回第二个旋钮
+// 已存过的 targetWords 必须被派生值覆盖，否则它又变回第二个旋钮
 assert.equal(resolveConfig({ targetWords: 99 }).targetWords, 4, "a stored targetWords is ignored");
 assert.equal(
   resolveConfig({ targetCjkCharacters: 24 }).targetWords,
@@ -129,7 +132,7 @@ assert.deepEqual(pickRecentMessages(undefined, 3), []);
 
 // 字节预算：多条长消息必须整体落在 maxInputBytes 内。
 // 官方 frameMessages 会 JSON.stringify 整个数组，超了它就抛错，
-// 表现为「没被命名」/「建议获取失败」，所以裁剪只能在我们这边做。
+// 表现为「没被命名」/「建议获取失败」，所以裁剪必须在这侧完成。
 const long = "问".repeat(2000); // 每个 3 字节
 const budgeted = pickRecentMessages(
   [{ seq: 1, text: long }, { seq: 2, text: long }, { seq: 3, text: long }],
@@ -205,11 +208,14 @@ const prompt = buildSystemPrompt({ targetWords: 4, targetCjkCharacters: 12 }, fa
 assert.ok(prompt.includes("about 4 words"), "the prompt must carry the derived word target");
 assert.ok(prompt.includes("12 CJK characters"), "the prompt must carry the CJK target");
 assert.ok(!prompt.includes("currentTitle"), "no anchor rules when there is no current title");
-// 有锚点时追加四条稳定性规则，否则每轮刷新都会把标题改写成同义词
+// 有锚点时追加四条稳定性规则：防止同话题追问把标题改成同义词而抖动，
+// 但话题真的换了必须明确换标题——旧版「only when materially change」门槛过高，
+// 实测把标题钉死（某会话 29 次刷新一字未改）。两条都要守。
 const anchored = buildSystemPrompt({ targetWords: 4, targetCjkCharacters: 12 }, true);
 assert.ok(anchored.includes("currentTitle"));
-assert.ok(anchored.includes("return it exactly unchanged"));
-assert.ok(anchored.includes("Do not reword, polish"));
+assert.ok(anchored.includes("return it exactly unchanged"), "same-topic follow-ups keep the exact wording");
+assert.ok(anchored.includes("introduce a different or expanded topic"), "a changed topic must be named");
+assert.ok(anchored.includes("write a new title"), "a stale title must be replaced, not frozen");
 assert.ok(anchored.length > prompt.length);
 
 const rows = [{ seq: 1, text: "第一句" }];
@@ -278,7 +284,7 @@ assert.equal(clampTitle(undefined, 12), undefined);
     }
   }
 
-  // 用户显式指定档位：模型有这个档位就照办（auto 的判断让位）。
+  // 显式指定档位：模型有这个档位就照办（auto 的判断让位）。
   assert.equal(pickReasoningEffort(efforts("low", "high"), "high"), "high", "an explicit effort is honored");
   assert.equal(pickReasoningEffort(efforts("off", "low"), "low"), "low", "explicit low beats auto's off");
   // 换模型后残留的旧档位：不能硬发（会抛错），退回 auto 的判断。
@@ -375,11 +381,35 @@ assert.equal(clampTitle(undefined, 12), undefined);
   // 是另一个 bundle，import 不到那份名单，各写一套迟早对不上。
   assert.equal(describeReasoning(effortsOf("off", "low"), 256).off, true, "a declared off is reported as off");
   assert.equal(describeReasoning(effortsOf("none", "low"), 256).off, true, "a declared none is reported as off too");
-  // 模型没声明关闭档，用户手填 none 也不算「关掉了」：档位会回退，off 必须 false。
+  // 模型没声明关闭档，手填 none 也不算「关掉了」：档位会回退，off 必须 false。
   assert.equal(describeReasoning(effortsOf("low", "high"), 256, "none").off, false, "an undeclared none is a fallback, not an off");
   assert.equal(describeReasoning(effortsOf("low", "high"), 256, "off").off, false, "an undeclared off is a fallback too");
 }
 
+// ---- titleExceedsBudget / buildShortenPrompt / frameShorten：超长缩短重试 ----
+// 与 clampTitle 共用宽度口径，但只判超没超；缩短失败仍由 clampTitle 兜底。
+assert.equal(titleExceedsBudget("代码改动审阅与大量提问", 12), false, "11 CJK = 22 units is inside 24");
+assert.equal(titleExceedsBudget("一二三四五六七八九十甲乙丙丁", 12), true, "13 CJK = 26 units exceeds 24");
+assert.equal(titleExceedsBudget("Rename sessions automatically", 12), true, "29 units exceeds 24");
+assert.equal(titleExceedsBudget("Rename sessions", 12), false);
+assert.equal(titleExceedsBudget("", 12), false, "empty never counts as over budget");
+assert.equal(titleExceedsBudget(undefined, 12), false);
+assert.equal(titleExceedsBudget("一二、三四五", 4), true, "wide punctuation counts toward the budget too");
+// 整段无空格的超宽 token：clampTitle 会放弃截断，但这里仍报超预算，
+// 好让缩短重试有机会处理（处理不了再回落到 clampTitle 的原样放行）。
+assert.equal(titleExceedsBudget("acme/nested/main-longer-token", 12), true);
+
+const shorten = buildShortenPrompt({ targetCjkCharacters: 12 });
+assert.ok(shorten.includes("12 CJK characters"), "shorten prompt must name the hard budget");
+assert.ok(shorten.includes("24 half-width units"), "and its half-width equivalent");
+assert.ok(shorten.includes("Keep the meaning"), "shortening must preserve the topic");
+assert.ok(shorten.includes("Return only the shortened title on one line"));
+assert.equal(
+  frameShorten("一个很长的标题"),
+  `Shorten this session title to the required length:\n一个很长的标题`,
+  "the overlong title is echoed back verbatim"
+);
+
 console.log(
-  "check ok: resolveConfig + pickRecentMessages + titleFromOutput + titleFromResponse + prompts + clampTitle + reasoning"
+  "check ok: resolveConfig + pickRecentMessages + titleFromOutput + titleFromResponse + prompts + clampTitle + shorten + reasoning"
 );

@@ -5,10 +5,10 @@
 # dsh-auto-rename
 
 **Automatic conversation naming for DeepSeek Harness.**
-Titles name themselves, refresh as the conversation grows, and the rename dialog streams
-AI suggestions.
+Titles are generated from the conversation and updated as it develops; the rename dialog
+streams AI suggestions.
 
-[![version](https://img.shields.io/badge/version-0.2.2-4176e6)](package.json)
+[![version](https://img.shields.io/badge/version-0.2.3-4176e6)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-4176e6)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-0.2.2--rc.1-6b7280)](#known-limits)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.19-6b7280)](package.json)
@@ -23,53 +23,52 @@ English · [中文](README.zh.md)
 
 ## Features
 
-**Names the conversation, and keeps up with it.** The first human message gets an AI title;
-after that, every new message re-reads the recent ones and refreshes it, so the title follows
-a topic that has moved on. Turn "Refresh title as the conversation grows" off and it goes back
-to naming the first message once. A manual rename pins the title either way, so it is never
-rewritten under your hands.
+**Generates and updates titles.** The first human message produces an AI title; after that,
+each new message re-reads the recent ones and updates it, so the title tracks the current
+topic. Turning "Refresh title as the conversation grows" off limits generation to the first
+message. A manual rename takes precedence in either mode and is not overwritten.
 
-**Suggests titles when you rename.** The **AI Name** button sits at the top of the conversation
-page. Its dialog looks and behaves like DSH's native rename window, with three extra things:
+**Suggests titles during renaming.** The **AI Name** button is located at the top of the
+conversation page. Its dialog matches DSH's native rename window in appearance and behavior,
+with three additions:
 
 | | |
 |---|---|
 | Streaming candidates | Suggestions arrive one at a time (NDJSON), each revealed by a 500 ms left-to-right sweep |
-| One-click apply | Click a chip to fill the input; **Regenerate** for a fresh set |
-| Native feel | Enter confirms, Esc closes, and Enter during IME composition never submits by mistake |
+| One-click apply | Selecting a chip fills the input; **Regenerate** fetches a fresh set |
+| Native behavior | Enter confirms, Esc closes, and Enter during IME composition never submits by mistake |
 
-**Uses a model you choose.** Naming follows the conversation's main model by default, or pins a
+**Configurable naming model.** Naming uses the conversation's main model by default, or a fixed
 cheaper one. The dropdown is built from the host's `remote.session.modelCatalog()`, which
 enumerates providers one by one and drops those that return nothing — so every entry is a model
-the host has actually authenticated and can really call.
+the host has authenticated and can call.
 
-**Reasoning, handled for you.** A title needs three or four words, but a reasoning model spends
-the budget thinking first — the same `max_tokens` the answer draws from. So four things happen
+**Reasoning settings.** A title needs three or four words, but a reasoning model spends
+the budget thinking first — the same `max_tokens` the answer draws from. Four rules apply
 automatically:
 
 | | |
 |---|---|
-| Off when it can be | The model's own switch-off level is sent when it declares one (named `off` on some gateways, `none` on others; only declared levels are ever trusted) |
-| Lowest level when it can't | Otherwise the lowest effort the model itself declares. Some gateways silently ignore an undeclared level instead of erroring, so a hand-typed level just makes the UI lie |
-| A bigger cap for reasoning models | Thinking that eats the budget returns an empty title; measured on one reasoning model, thinking ran 325–3172 tokens, so reasoning models get 4096 (the schema ceiling). The cap only bounds generation and returns at `stop`, so it does not slow anything down — the timeout is the real guard |
-| One retry when thinking ate it | Retried only on a `max-tokens` cut, at most twice, each attempt getting its own full timeout; other failures repeat identically so they are not retried |
+| Switch reasoning off when declared | The model's own switch-off level is sent when it declares one (named `off` on some gateways, `none` on others; only declared levels are ever trusted) |
+| Otherwise use the lowest declared level | The lowest effort the model itself declares is used. Some gateways silently ignore an undeclared level instead of erroring, so a manually entered level can appear configured while having no effect |
+| Raise the cap for reasoning models | Reasoning that consumes the whole budget returns an empty title; measured on one reasoning model, reasoning ran 325–3172 tokens, so reasoning models get 4096 (the schema ceiling). The cap only bounds generation and returns at `stop`, so it does not slow anything down — the timeout is the real guard |
+| One retry when reasoning consumes the budget | Retried only on a `max-tokens` cut, at most twice, each attempt getting its own full timeout; other failures repeat identically so they are not retried |
 
-The in-dialog settings panel states which of the four applies: reasoning switched off / fell back
+The in-dialog settings panel reports which of the four applies: reasoning switched off / fell back
 to the lowest level / not a reasoning model so no effort is sent / this model's capability could
-not be read. Switching model refreshes that
-line and the level list immediately.
+not be read. Switching model updates that line and the level list immediately.
 
-**Leaves the audit trail.** The provider id `dsh-auto-rename` is written into `source.provider`
-of every `session/title` event, so you can always tell which titles this plugin produced.
+**Audit trail.** The provider id `dsh-auto-rename` is written into `source.provider`
+of every `session/title` event, so titles produced by this plugin remain identifiable.
 
 <details>
-<summary><b>Why it builds its own dialog instead of extending the native one</b></summary>
+<summary><b>Why the dialog is self-rendered instead of extending the native one</b></summary>
 
 The native rename window is an internal host component with no extension point: `RenameForm`
 declares no injectable slot, the `requestSessionRename` it needs is passed only as a prop into
 sidebar menu items, and nothing in the bundle `ctx.provide`s it. The plugin can therefore
-neither insert a suggestion row into it nor open it programmatically. It builds its own dialog
-and copies the native window's CSS rules one by one, so the two are visually indistinguishable.
+neither insert a suggestion row into it nor open it programmatically. It renders a separate
+dialog and copies the native window's CSS rules one by one, so the two are visually indistinguishable.
 
 </details>
 
@@ -95,8 +94,8 @@ Restart DSH afterwards. Client-side changes hot-reload; host-side changes need t
 ## Settings
 
 Open the **AI Name** dialog and click the gear in its title row, left of the close button. The
-panel expands inside the same dialog. Edits are staged in a draft and written only when you
-press **Save**; an empty field means "use the default".
+panel expands inside the same dialog. Edits are staged in a draft and written only when
+**Save** is pressed; an empty field means "use the default".
 
 | Field | Default | Notes |
 |---|---|---|
@@ -114,7 +113,7 @@ at startup and errors clearly when used, rather than silently doing nothing.
 
 ## How it works
 
-**It reads only what you typed.** Neither path looks at assistant replies: automatic naming
+**Input source.** Neither path reads assistant replies: automatic naming
 takes the six most recent human messages (only the first one is ever scheduled when the refresh
 toggle is off), suggestions take the three most recent ones, so both describe the topic in
 progress. Each message is clipped to `maxInputBytes` (default 4096) before it reaches the model,
@@ -126,16 +125,18 @@ default `12` allows 12 Chinese characters or 24 Latin characters including space
 3–4 words. One knob governs both scripts; there is no separate word count for English, because
 word lengths vary too much for a count to mean anything.
 
-The official shared implementation still wants a `targetWords` value (prompt-only, never
+The official shared implementation still requires a `targetWords` value (prompt-only, never
 truncating), so it is derived from the same budget at ~6 units per word — `12` yields `4`. That
 keeps the model's target close to the hard cut instead of writing long and being trimmed.
 
-**Truncation avoids mangling words.** A cut landing mid-word falls back to the previous space,
-so you never get `sessio`. When there is no space to fall back to — a `provider/model` route, a
-URL — the title is left alone: slightly too wide beats a broken word.
+**Truncation preserves word boundaries.** When a generated title is over budget, the model is
+asked once to shorten it while keeping its meaning; only if that fails or still runs long
+does truncation apply. A cut landing mid-word falls back to the previous space, so fragments
+such as `sessio` are avoided. When there is no space to fall back to — a `provider/model` route,
+a URL — the title is left alone: slightly too wide beats a broken word.
 
 <details>
-<summary><b>Why the plugin has to truncate at all</b></summary>
+<summary><b>Why truncation is performed at all</b></summary>
 
 The official caller passes `Number.MAX_SAFE_INTEGER` as the truncation argument of
 `normalizeSessionTitle` — that is, no truncation whatsoever. The host does enforce a
@@ -157,7 +158,7 @@ locale/          Display metadata for the plugin manager (title, description).
 test/            Self-checks: logic, host apply, client render, locale audit, patch.
 ```
 
-The two halves talk over three HTTP routes, each accepting loopback origins only
+The two halves communicate over three HTTP routes, each accepting loopback origins only
 (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) and rejecting `sec-fetch-site: cross-site`:
 
 | Route | Purpose |
@@ -218,8 +219,8 @@ the call wiring can be verified outside DSH without reimplementing the official 
 - **Suggestions are not logged.** They do not write a `session/title-llm-request` event: that
   event is the one-shot audit record for automatic naming, and suggestions can be regenerated
   without limit, so logging them would bloat the session log.
-- **The 4096 floor is a measured calibration, not a theory.** It was raised step by step from
-  one and the same model repeatedly eating smaller budgets dry; a model that thinks even more
+- **The 4096 floor is a measured calibration, not a theory.** It was raised step by step as
+  the same model repeatedly exhausted smaller budgets; a model that reasons even more
   verbosely needs a retest. Also, "the model declares a switch-off level" only means that level
   is sent to it — some gateways map it elsewhere and keep thinking anyway, and that case is
   covered by the retry, not by the judgement here.
