@@ -6,7 +6,7 @@
  *  - 建议路由能走通（LLM 用替身）
  *
  * 这一步不需要 DSH 在跑，是「改完先证明接线对」的最小成本手段。
- * 依赖：node_modules/@deepseek-ai/schemastery（指向 profile 里那份）。
+ * 依赖：schemastery 在本地链接可用。
  */
 
 import assert from "node:assert/strict";
@@ -43,9 +43,7 @@ function makeWebServer(routes) {
 /**
  * 最小 response 替身：记录 status 与 JSON body。
  *
- * headersSent 必须模拟真实语义：node 的 writeHead 一旦调用它就为 true，
- * 之后不可能再改状态码。替身若不给这个属性，「未开流就失败应走 500」那条
- * 断言就是恒真的废话（实测踩过：真实环境里 writeHead 后 headersSent 立刻为 true）。
+ * 替身必须实现 headersSent：调用 writeHead 后即为 true。
  */
 function makeRes() {
   return {
@@ -117,8 +115,8 @@ assert.equal(name, "dsh-auto-rename");
 assert.deepEqual(inject, ["sessionTitle", "llm", "sessions", "webServer"]);
 assert.ok(Config, "Config must be exported");
 
-// 标题长度只有 targetCjkCharacters 一个旋钮：targetWords 已从 schema 移除，
-// 由 resolveConfig 从宽度预算派生。schema 是宿主 loader 校验 profile 的依据，
+// 标题长度只有 targetCjkCharacters 一个旋钮：targetWords 不作为 schema 字段，由 resolveConfig 从宽度预算派生。
+// schema 是宿主 loader 校验 profile 的依据，
 // 留着它就会让「改了没反应」变成界面能填、后端不认。
 assert.deepEqual(Object.keys(Config.dict), [
   "provider",
@@ -152,7 +150,7 @@ assert.deepEqual(Object.keys(Config.dict), [
     const schema = Config.dict[field];
     assert.equal(schema.meta?.default, want, `${field} must declare a default so the host's reset button restores a value`);
     // volatile 的语义是「这些字段变化不触发插件重载」，不是「不持久化」，
-    // 所以它能和 .default() 共存（官方 dsh-bash-local 就这么写）。
+    // 所以它能和 .default() 共存。
     assert.equal(schema.meta?.volatile, true, `${field} stays volatile so a settings change never reloads the plugin`);
   }
 }
@@ -418,18 +416,23 @@ assert.deepEqual(Object.keys(Config.dict), [
 }
 
 // ---- 4c. 每次重试拿一份满额超时，而不是接着吃上次剩下的 ----
-// executeSessionTitleLlm 的 deadline = request.signal ⊔ timeoutMs。原先两次尝试共用
-// 调用方那一个信号：第一次把 40 秒用掉，重试就只剩 20 秒，慢模型（实测单次
-// 25–40 秒）必然赶不上，重试形同虚设。所以第 2+ 次必须换新信号。
+// executeSessionTitleLlm 的 deadline = request.signal ⊔ timeoutMs。每次尝试必须带
+// 独立的满额超时信号，共用单一超时会让重试只剩剩余预算。
 {
   const reasoningModel = { reasoning: { efforts: [{ id: "low", name: "Low" }] } };
   const { ctx, services } = makeCtx();
   const registered = [];
   services.set("sessionTitle", { register: (p) => registered.push(p) });
-  services.set("llm", { resolveModelInfo: async () => reasoningModel });
+  services.set("llm", {
+    resolveModelInfo: async (provider, model, signal) => {
+      seenProbeSignal = signal;
+      return reasoningModel;
+    }
+  });
   services.set("sessions", { get: () => undefined });
   services.set("webServer", makeWebServer([]));
   const seen = [];
+  let seenProbeSignal;
   ctx.__testTitleGeneration = (payload) => {
     seen.push(payload.request.signal);
     return seen.length === 1
@@ -441,6 +444,12 @@ assert.deepEqual(Object.keys(Config.dict), [
   const upstream = AbortSignal.timeout(5000);
   const result = await registered[0].generate({ session: {}, messages: [{ seq: 1, text: "hi" }], signal: upstream });
   assert.equal(seen.length, 2, "the retry still runs");
+  // 生成路径的 probe 信号带独立超时，不是 undefined。
+  assert.ok(seenProbeSignal instanceof AbortSignal, "the generate-path probe carries a bounded signal");
+  assert.equal(seenProbeSignal.aborted, false, "and it is not already expired");
+  // 每一次 attempt 都用合成的新信号，不复用调用方的。
+  // MUTANT：把第 0 次改回 `attempt === 0 ? request : ...` → seen[0] === upstream → 红。
+  assert.notStrictEqual(seen[0], upstream, "attempt 0 also uses a fresh signal with a full budget");
   assert.notStrictEqual(seen[1], upstream, "a retry must not reuse the caller's signal");
   assert.equal(seen[1].aborted, false, "the retry signal is fresh, so it carries a full budget instead of the remainder");
   // 上游取消半段移到了下面「cancelled」用例，这里只留满额超时的断言。
@@ -521,8 +530,7 @@ assert.deepEqual(Object.keys(Config.dict), [
 }
 
 // ---- 4f. 稳定性规则：同话题保持原词，但换话题必须换标题 ----
-// 旧版把「materially change」门槛定太高，实测标题被钉死。这里用替身回显
-// prepared.system，断言新规则把「换话题要写新标题」说成明确指令。
+// 用替身回显 prepared.system，断言提示词把换话题要写新标题写成明确指令。
 {
   const { ctx, services } = makeCtx();
   const registered = [];
@@ -578,9 +586,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   const settingsRoute = routes.find((r) => r.path === "/dsh-auto-rename/settings");
   assert.equal(provider.automatic, "first-prompt", "disabled auto refresh names the first prompt only");
 
-  // 关掉之后 generate() 必须照常出 AI 标题：first-prompt 那一次排程是宿主在写
-  // 兜底标题之前**同步**做的判断，所以这一次调用真的会发生。旧实现在这里抛错，
-  // 等于关掉就再没有 AI 命名、只剩首条消息截断 —— 那不符合所需语义。
+  // 关闭后 generate() 仍须产出 AI 标题：first-prompt 那次排程是同步判断。
   const titled = await provider.generate({
     session: {},
     messages: [{ seq: 1, text: "阅读文档完成接手" }],
@@ -590,7 +596,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.deepEqual(titled.messageSeqs, [1], "the first message is the source");
 
   // 就地切换：volatile 字段改了宿主**不会**重新 register()，所以节拍必须是活的
-  // getter。快照写死的话「关闭」要等重启才生效 —— 正是本仓库记过多次的假生效。
+  // getter。快照写死的话「关闭」要等重启才生效。
   await settingsRoute.handler(makeReq({ autoRenameEnabled: true }), makeRes());
   assert.equal(registered.length, 1, "flipping a setting must not re-register the provider");
   assert.equal(provider.automatic, "all-prompts", "the cadence follows the setting without re-registering");
@@ -623,7 +629,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   services.set("sessions", { get: () => undefined });
   services.set("webServer", makeWebServer(routes));
   apply(ctx, {});
-  // 按路径取，不用索引：路由数量会变（加设置写路由时索引断言就断过一次）。
+  // 按路径取路由，路由数量会变化，索引断言不稳定。
   const routeOf = (path) => routes.find((route) => route.path === path);
   const configRoute = routeOf("/dsh-auto-rename/config");
   const suggestRoute = routeOf("/dsh-auto-rename/suggest");
@@ -944,9 +950,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.equal(updates.length, 2, "nothing was written for the rejected request");
 
   // 空字符串的 provider/model 表示「清空 = 跟随主模型」。
-  // ⚠️ 绝不能用 `{ provider: undefined }` 传：宿主 settings.update 的入参先过
-  // cloneJsonShaped，它明确剥掉 undefined 条目，而 mergeLayers 只合并不删除 ——
-  // 那样界面显示「已保存」，值根本没动。清空只能走 mutate 的 {op:"unset"}。
+  // 清空需用 mutate 的 {op:unset}：settings.update 会剥掉 undefined 条目。
   res = makeRes();
   await settingsRoute.handler(makeReq({ provider: "", model: "  " }), res);
   assert.equal(res.status, 200);

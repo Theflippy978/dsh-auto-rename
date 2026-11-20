@@ -1,9 +1,7 @@
 /**
  * 离线验证 cordis.patch.yml 的组合结果。
  *
- * 直接复用官方 composeEntries 的语义（applyEntryPatches 是「THE patch semantics」，
- * dump-config 与真实 mount 共用它），但只把需要的那几行抽出来跑，避免拖起整个
- * dsh-app-boot（它依赖 commander / dsh-home-paths 等一大串）。
+ * 提取 patch 应用的等价逻辑离线验证，避免引入完整启动链依赖。
  *
  * 断言两件事：
  *  1. 内置的 session-title-llm 行确实被 disabled: true 关掉
@@ -18,7 +16,7 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, "..");
 
-// ---- 官方 applyEntryPatches 的等价实现（逐行对齐 dsh-app-boot 的 61-110 行）----
+// ---- applyEntryPatches 的等价实现 ----
 function applyEntryPatches(data, patches, warn = () => {}) {
   if (!patches?.length) return [...data];
   data = structuredClone(data);
@@ -67,9 +65,8 @@ function applyEntryPatches(data, patches, warn = () => {}) {
   return data;
 }
 
-// ---- 读 patch 用官方同款 yaml 解析 ----
-// 不自造解析器：手写版本漏判过一遍，而 DSH 本身就依赖 yaml，profile 里现成有。
-// 本地开发时从 profile 链一份：见 README 的「开发」一节。
+// ---- 读 patch 用 yaml 解析 ----
+// 直接用宿主依赖的 yaml 包解析，不自造解析器。
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const YAML = require("yaml");
@@ -82,7 +79,7 @@ assert.ok(Array.isArray(patches), "cordis.patch.yml must be a top-level array");
 assert.ok(patches.length >= 2, `expected >= 2 patch entries, parsed ${patches.length}`);
 assert.ok(Array.isArray(patches[0].insert), "first patch must be an insert");
 
-// ---- dsh-base 的原始行（只保留本测试关心的两条，取自 asar 内 dsh-base/cordis.patch.yml）----
+// ---- 宿主原始行，仅保留本测试关心的两条 ----
 const baseRows = [
   { id: "session-title", name: "@deepseek-ai/dsh-session-title", config: { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 } },
   { id: "session-title-llm", name: "@deepseek-ai/dsh-session-title-first-prompt-llm", config: { targetWords: 5, targetCjkCharacters: 10, maxInputBytes: 4096, maxOutputTokens: 64, timeoutMs: 60000 } },

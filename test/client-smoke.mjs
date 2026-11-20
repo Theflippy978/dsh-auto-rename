@@ -31,9 +31,8 @@ function loadClient() {
       }
     }
   };
-  // 样式注入要一个真的 document：client.js 按宿主官方手法插一个 <style>
-  // （官方写的是裸 `document`，不是 window.document）。断言挂在 styleTags 上，
-  // 所以这里只需最小实现（createElement + head.appendChild + querySelector 去重）。
+  // 样式注入需要一个 document 替身：client.js 会插入一个 <style> 标签。
+  // 断言挂在 styleTags 上，这里只需最小实现（createElement + head.appendChild + querySelector 去重）。
   const document = {
     head: { appendChild: (tag) => styleTags.push(tag) },
     createElement: () => ({ dataset: {}, textContent: "" }),
@@ -55,11 +54,8 @@ function loadClient() {
 /**
  * SettingsFormModel 的严格替身。
  *
- * 目的不是复刻行为，而是**守住契约**：官方实现要求 scope 提供
- * getSnapshot()/subscribe()/mutate(ops, revision)，且快照带
- * status/value/base/revision/writable。上一版卡片喂的是 settingsScope.bind 的
- * 产物（只有 set/unset，没有 mutate），所以表单根本没法工作 —— 这里缺一个
- * 方法就当场抛，防止再退回那条死路。
+ * 替身严格校验 scope 必须提供 getSnapshot/subscribe/mutate，快照需带
+ * status/value/base/revision/writable，缺任一项当场抛错。
  */
 class FakeSettingsFormModel {
   specs;
@@ -98,7 +94,7 @@ class FakeSettingsFormModel {
   }
   shell() {
     const snapshot = this.scope.getSnapshot();
-    // invalid 要真算：官方实现里 parse 返回 undefined 的草稿会让保存锁住。
+    // invalid 需真实计算：parse 返回 undefined 的草稿会锁住保存。
     // 写死 false 的话，"非数字草稿被拒" 这条断言就成了恒真的废话。
     const invalid = [...this.staged.entries()].some(([name, text]) => {
       const spec = this.specs.find((entry) => entry.field === name);
@@ -170,11 +166,7 @@ function makeRequire(window) {
   };
   window.__renderComponent = renderComponent;
   /**
-   * useState 替身：**必须真的记住状态**。
-   *
-   * 早期版本每次渲染都返回初值，于是「点开设置面板 → 重新渲染」这条路径永远
-   * 回到收起态，测试要么漏掉面板内容、要么得靠手工调 props 绕过 —— 那是假通过。
-   * 这里按组件实例（renderComponent 分配的槽位）存值，setter 写回同一个槽。
+   * useState 替身按组件实例存值，setter 写回同一槽位，确保重新渲染后状态保持。
    */
   const hookValue = (initial) => {
     if (!activeHooks) throw new Error("React hook rendered outside renderComponent");
@@ -195,7 +187,7 @@ function makeRequire(window) {
     useRef: (initial) => hookValue(() => ({ current: initial }))[0],
     // React 的真实签名：useSyncExternalStore(subscribe, getSnapshot)。
     // 这里严格按这个契约校验：第一个参数必须能订阅并返回 disposer，
-    // 第二个必须是取快照的函数 —— 参数写反就直接报错（曾经踩过）。
+    // 第二个必须是取快照的函数 —— 参数写反会直接报错。
     useSyncExternalStore: (subscribe, getSnapshot) => {
       if (typeof subscribe !== "function") throw new TypeError("arg1 of useSyncExternalStore must be subscribe");
       if (typeof getSnapshot !== "function") throw new TypeError("arg2 of useSyncExternalStore must be getSnapshot");
@@ -218,8 +210,7 @@ function makeRequire(window) {
         IconChevronDownOutlineRegular: "IconChevronDownOutlineRegular",
         SettingsForm: "SettingsForm",
         SettingsValueField: "SettingsValueField",
-        // 与真实实现逐条对齐：format 只认字符串（String(undefined) 会得到
-        // "undefined"，让下拉凭空多出一条假选项）；空串是 clear 而不是 set。
+        // format 只认字符串，避免 String(undefined) 产生假选项；空串是 clear 而不是 set。
         settingsTextField: (field) => ({
           field,
           format: (value) => (typeof value === "string" ? value : ""),
@@ -303,11 +294,9 @@ function makeConfigForms(behaviour = {}) {
       return scope;
     },
     /**
-     * 与官方 ConfigForms.whileServed 同签名：命名空间被宿主服务时立刻调
-     * register(served)，返回的 disposer 负责收尾。
-     * `notServed` 模拟「宿主没服务这个命名空间」—— 那时 register 不该被调用，
-     * 插件页里也不该留下本插件的痕迹（官方 ui-settings-shell 与
-     * @wenaixi/dsh-ponytail 都是同一生命周期协议）。
+     * whileServed：命名空间被宿主服务时立刻调 register(served)，
+     * 返回的 disposer 负责收尾。`notServed` 模拟宿主没服务该命名空间，
+     * 那时 register 不该被调用，插件页里也不该留下痕迹。
      */
     whileServed(namespaces, register) {
       assert.deepEqual(namespaces, ["dsh-auto-rename"], "the card follows this plugin's own namespace");
@@ -458,38 +447,14 @@ function renderEntry(entry, extraProps = {}) {
 /**
  * 假 ctx。
  *
- * exports.inject 只声明硬性服务（slots/locale/sessions）；configForms 走
- * ctx.inject 延迟取、remote 走 get 可选取 —— 替身必须照这个契约给，
- * 否则测不出「服务缺席时只少一块界面、不炸整个 client」。
+ * exports.inject 只声明硬性服务（slots/locale/sessions）；configForms 与 remote 都走
+ * ctx.get 可选查找 —— 替身照这个契约给，否则测不出「服务缺席时只少一块界面、不炸整个 client」。
  *
- * 关键：inject 回调收到的是受限 Context facade，但它的 get(name) 是**可选查找**
- * （真实实现 readService(name, false)，不要求 name 在 inject 声明里）。
+ * ctx 是受限 facade，其 get(name) 为可选查找，不需在 inject 声明里。
  *
- * ⚠️ **`remote.session` 必须注册成独立服务**：宿主 api-gateway 按 namespace 逐个
- * 注册，`remoteServiceKey(ns)` 返回 `remote.${ns}`（源码实证），所以它**不是**
- * `remote` 的属性。早期替身写成 `remote = { session: {...} }`，正好掩盖了
- * 「只 inject remote、读 remote.session」这个真实 bug（嵌套形状下目录读不到）。
- * 别再改回嵌套形状。
- */
-/**
- * 假 ctx。
+ * remote.session 是独立服务，需单独注册；把服务注册成 remote 的属性会导致目录读不到。
  *
- * exports.inject 只声明硬性服务（slots/locale/sessions）；`remote.session` 走
- * `ctx.get` 可选查找 —— 替身必须照这个契约给，否则测不出「服务缺席时只少一块
- * 界面、不炸整个 client」。
- *
- * 关键：apply 收到的 ctx 是 runner 的受限 facade，它的 `get(name)` 是**可选查找**
- * （真实实现 readService(name, false)，不要求 name 在 inject 声明里）。
- *
- * ⚠️ **`remote.session` 必须注册成独立服务**：宿主 api-gateway 按 namespace 逐个
- * 注册，`remoteServiceKey(ns)` 返回 `remote.${ns}`（源码实证），所以它**不是**
- * `remote` 的属性。早期替身写成 `remote = { session: {...} }`，正好掩盖了
- * 「读 remote.session 属性」这个真实 bug（嵌套形状下目录读不到）。别再改回嵌套形状。
- *
- * ⚠️ **`ctx.inject` 在真实 facade 上根本不存在**，读它**抛错**（不是 undefined）——
- * runner 的 `dynamicCordisContext` 是个只暴露 `get` + CTX_VERBS 的 Proxy。
- * 替身照实模拟：谁写了 `ctx.inject`，谁就在这里当场炸。那正是「读不到宿主已认证的
- * 模型」的根因，这条替身契约就是为了让同类错误立刻暴露。
+ * 替身的 inject getter 直接抛错，用于验证代码不读取该接口。
  */
 function makeCtx(slots, sessions, configForms, session) {
   const services = new Map([
@@ -546,11 +511,7 @@ function makeRemote(behaviour = {}) {
 }
 
 const HEADER = "conversation.session.header.actions";
-// 第三方插件走 plugins.bundle.config：keyed 槽，**key 取 bundle 包名**，渲染在该
-// bundle 自己的详情页里。@wenaixi/dsh-ponytail（key: "@wenaixi/dsh-ponytail"）与官方
-// dsh-experimental-client-ui-cot-translation / -voice-input 都是这个形态。
-// plugins.item 是插件页顶部「内置插件配置」区的列表条目，官方自己那四个 settings-*
-// 页用它是为了挤在同一块「内置」区里 —— 第三方插件混进去会与官方设置页混排，层级不对。
+// 使用 plugins.bundle.config keyed 槽（key 为 bundle 包名），渲染在本 bundle 详情页，不使用 plugins.item。
 const CARD = "plugins.bundle.config";
 
 /** 等目录的 promise 链跑完（loadCatalog 是异步的）。 */
@@ -560,7 +521,7 @@ async function flush() {
 
 // ---- 1. 模块元数据 ----
 assert.equal(typeof exports.apply, "function", "client must export apply");
-// 只声明硬性服务：configForms 走 ctx.inject、remote 走 ctx.get，
+// 只声明硬性服务：configForms 与 remote 都走 ctx.get 可选查找，
 // 免得部署缺任一个就把整个 client 半边（含顶部按钮）一起弄没。
 assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject list");
 
@@ -581,7 +542,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
   const button = renderButton(component, { sessionId: "s1" });
   assert.equal(button.props.disabled, false, "with a session the entry is enabled");
-  // 与同槽位的 Agent Team 原生交互标签对齐：默认 tertiary，无底色，hover/focus-visible 变 primary。
+  // 按钮默认 tertiary、无底色，hover/focus-visible 提升文字颜色。
   assert.equal(button.props.type, "button");
   assert.equal(button.props.style.color, "var(--dsw-alias-label-tertiary)");
   assert.equal(button.props.style.background, "transparent");
@@ -733,12 +694,11 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   // 样式表必须真的注入，且只注一次（apply 可能被跑多次）。
   assert.equal(styleTags.length, 1, "the dialog stylesheet is injected exactly once");
   const css = styleTags[0].textContent;
-  // 根因断言：宿主 .dialog 自己不设 max-height（官方注释要求调用方 cap growth），
+  // 宿主 .dialog 不设 max-height，调用方须自行限高。
   // 省略该参数就是「整个弹窗上下超出屏幕、标题和底部被裁掉」。
   assert.match(css, /\.dsh-auto-rename-dialog\{max-height:100%\}/, "the dialog caps its height");
   // 滚动必须落在 .body（content 的最后一个子元素），**不能**开在 .content 上。
-  // Edge headless 实测：开在 content 上时滚动条挤压 header 宽度，把关闭键往左推，
-  // 相对 .dialog 定位的设置图标偏了 15px（正好压在关闭键上）。
+  // 滚动条落在 content 上会挤压 header，使设置图标与关闭键重叠。
   assert.match(
     css,
     /\.dsh-auto-rename-dialog-content>:last-child\{overflow-y:auto;min-height:0\}/,
@@ -782,11 +742,8 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   const slots = makeSlots();
   await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
 
-  // 关键契约：设置页真的注册进宿主槽位了。
-  // 曾经这里是「注册代码走通、真实界面不渲染」，根因**不在宿主**：installSettingsCard
-  // 第一行读的是 `ctx.inject`，而受限 facade 的 CTX_VERBS 里根本没有 inject，读它
-  // 直接抛错 —— 整段在真实环境里第一行就退出了，一个 entry 都没注册过。
-  // 现在取服务走 ctx.get，这条断言守住「真的注册进去了」。
+  // 断言设置页注册进了宿主槽位。
+  // 取服务走 ctx.get，断言注册过程无异常退出。
   const cards = slots.of(CARD);
   assert.equal(cards.length, 1, "the settings page registers into the bundle's own config slot");
   assert.equal(
@@ -800,7 +757,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(slots.of(HEADER).length, 1, "the header entry still registers alongside it");
 }
 
-// ---- 3a. 宿主没服务这个命名空间：整块不出现（官方 shell / ponytail 同一协议） ----
+// ---- 3a. 宿主没服务这个命名空间时整块不出现 ----
 {
   const slots = makeSlots();
   await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms({ notServed: true })));
@@ -866,8 +823,8 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
 // ---- 3c. 弹窗内自绘的设置面板：直接渲染，不依赖宿主槽位 ----
 {
-  // 面板直接渲染（不走 React 状态流转：替身无法驱动 useState 的 set → re-render 循环，
-  // 那条路径只会得到假通过）。settingsStore 由测试自己造，语义与 HeaderAction 里一致。
+  // 面板直接渲染：替身无法驱动 useState 的 set → re-render 循环。
+  // settingsStore 由测试自己造，语义与 HeaderAction 里一致。
   const SettingsPanel = exports.__test.SettingsPanel;
   assert.equal(typeof SettingsPanel, "function", "the panel is exported for direct rendering");
   const flat = (node) => node.children.flat(Infinity).filter(Boolean);
@@ -972,9 +929,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   }
 
   // 3. 保存中：按钮显示 saving 且禁用，避免连点
-  //    状态字段是 status（idle/loading/saving/saved/error），不是 saving —— 早先
-  //    读 state.saving 恒 undefined，按钮永不禁用、连点会发出多次写。这条断言
-  //    钉住正确字段，别退回假字段。
+  //    保存中状态由 status 字段表达，保存中禁用按钮以防连点重复写。
   const saving = nodes({ ...base, status: "saving" })
     .find((n) => n.type === "Button" && n.children.includes("saving"));
   assert.ok(saving, "a saving panel shows its busy label");
@@ -994,8 +949,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   headerStore.set({ state: "pending", message: "" });
 
   // 5. 圆角方框：设置区必须是一个有边框的框，不能跟建议栏糊在一起。
-  //    边框不能省成「只靠底色」——浅色主题下 bg-layer-1/2/3 全是 #fff（令牌表实测），
-  //    只靠填充的话方框在浅色主题里完全隐形。
+  //    浅色主题下各层底色相同，方框不能只靠底色区分。
   const root = panel();
   assert.equal(root.props.style.borderRadius, "var(--dsw-radius-lg)", "the settings block is a rounded box");
   assert.match(root.props.style.border, /solid/, "the box has a visible border in both themes");
@@ -1013,9 +967,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     assert.equal(control.props.inputMode, "numeric", "numeric fields ask for the numeric keypad");
   }
 
-  // 7. 命名模型：两个**只读**框显示当前选择 + 图标按钮打开宿主已认证模型下拉。
-  //    上一版退化成手填 provider/model，
-  //    手填错一个字符就变成「配置半对」，要到第一次自动命名才报错。
+  // 7. 命名模型用两个只读框加图标下拉，避免手填造成配置半对。
   const pair = nodes().filter(
     (n) => n.type === "input" && ["settings.provider", "settings.modelName"].includes(n.props["aria-label"])
   );
@@ -1030,7 +982,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     "provider comes first, matching how the route is written"
   );
 
-  // 选择器用宿主官方 P.Menu（自带锚定定位、键盘遍历、外部点击关闭）。
+  // 选择器用 P.Menu，自带锚定定位与键盘遍历。
   const menu = nodes().find((n) => n.type === "Menu");
   assert.ok(menu, "the picker is an anchored Menu, not a hand-rolled dropdown");
   assert.equal(menu.props.portal, true, "portal escapes the dialog's overflow clipping");
@@ -1163,8 +1115,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   );
 
   // 8c. 档位下拉：选项只能是「自动 + 模型自己声明的档位」。
-  //     有的网关对未知档位不报错、直接忽略（实测收到没声明的档位也照样思考），
-  //     所以绝不能给一个自由输入框，让人以为自己选了个生效的值。
+  //     有的网关对未知档位直接忽略，因此不提供自由输入框。
   const selectOf = (info) => nodes(base, catalogOf(), info).find((n) => n.type === "select");
   assert.equal(selectOf(null), undefined, "no probe result → no dropdown");
   assert.equal(
@@ -1197,7 +1148,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
 
   // 8e. 数字行的 hint 必须带上 schema 范围：输入框没有 min/max/step 可摆，
   //     越界值发给 host 只会被 schemastery 拒成「保存失败」，无法从界面看出是超范围。
-  //     范围写进 hint 是懒解，但至少把边界说清楚了。
+  //     范围写进 hint 以说明字段边界。
   //     假 locale 的 t() 返回键名，所以这里直接查导出字典（中英两张都查：
   //     只改一张的话另一半语言看不到范围）。
   const dictionaries = exports.__test.dictionaries;
@@ -1292,10 +1243,8 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
     quiet.restore();
   }
 }
-// ---- 3b. apply 必须从 `remote.session` 服务取目录，而不是 `remote.session` 属性 ----
-// 这条守住真实故障：宿主 api-gateway 按 namespace 逐个注册服务（`remote.${ns}`），
-// `remote.session` 是**独立服务**。早期实现只 inject `remote` 再读 `remote.session`
-// 属性，恒为 undefined —— 目录永远读不到，模型一栏空置。
+// ---- 3b. apply 从 remote.session 服务取目录 ----
+// remote.session 是独立服务，从该服务取目录；当作 remote 的属性读取会得到 undefined。
 {
   const slots = makeSlots();
   const session = makeRemote();
@@ -1346,10 +1295,8 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   );
 }
 
-// ---- 3c. 目录首次失败后，服务晚到仍能恢复（一次早失败不能永久卡住） ----
-// ⚠️ modelCatalog 是**模块级单例**（apply 每次接同一个实例），所以这里不假设初始
-// 状态是 error —— 前面的用例可能已经把它拉成 ready。改为验证「拿到服务后一定能用」，
-// 以及「服务缺席时 load() 会如实报 error 而不是假装空目录」。
+// ---- 3c. 目录首次失败后，服务晚到仍能恢复 ----
+// modelCatalog 是模块级单例，跨用例共享状态；这里验证拿到服务后可用，以及服务缺席时 load() 报 error。
 {
   const slots = makeSlots();
   // 服务缺席时 load() 必须报 error：空列表会被误认为「宿主没有模型」。

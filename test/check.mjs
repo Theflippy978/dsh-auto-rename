@@ -22,6 +22,7 @@ import {
   resolveConfig,
   buildShortenPrompt,
   frameShorten,
+  stripEmoji,
   titleExceedsBudget,
   titleFromOutput,
   titleFromResponse,
@@ -29,8 +30,7 @@ import {
 } from "../lib/config.js";
 
 // ---- readVolatile：schemastery volatile 引用必须解包 ----
-// 这是实测踩到的坑：volatile 字段运行时是 {get(){...}} 引用对象，直接读拿到 {},
-// 表现为「设置改了没反应」且不报错。用真实 schemastery 的 Config 造一个来守。
+// volatile 字段运行时是带 get() 的引用对象，直接读会得到 {}。
 {
   let z;
   try {
@@ -94,7 +94,7 @@ assert.equal(resolveConfig({ suggestionCount: undefined }).suggestionCount, DEFA
 
 // ---- targetWords 是派生值，不是配置旋钮 ----
 // 英文不设词数上限，只受「中文 12 字」换算出的显示宽度约束。
-// 但官方提示词要求它是正整数，所以从宽度预算折算：
+// targetWords 需为正整数，因此从宽度预算折算。
 // 预算 = 字数 × 2 个半角单位，一个英文词按 6 单位估。
 assert.equal(resolveConfig().targetWords, 4, "12 CJK -> 24 units -> 4 words");
 // 已存过的 targetWords 必须被派生值覆盖，否则它又变回第二个旋钮
@@ -131,8 +131,7 @@ assert.deepEqual(pickRecentMessages([], 3), []);
 assert.deepEqual(pickRecentMessages(undefined, 3), []);
 
 // 字节预算：多条长消息必须整体落在 maxInputBytes 内。
-// 官方 frameMessages 会 JSON.stringify 整个数组，超了它就抛错，
-// 表现为「没被命名」/「建议获取失败」，所以裁剪必须在这侧完成。
+// 拼帧会对整个数组做 JSON.stringify，超长会抛错，因此需在此侧裁剪。
 const long = "问".repeat(2000); // 每个 3 字节
 const budgeted = pickRecentMessages(
   [{ seq: 1, text: long }, { seq: 2, text: long }, { seq: 3, text: long }],
@@ -169,6 +168,16 @@ assert.equal(titleFromOutput("*单个星号*"), "单个星号");
 assert.equal(titleFromOutput("**a** and **b**"), "**a** and **b**");
 assert.equal(titleFromOutput(""), "");
 assert.equal(titleFromOutput(undefined), "");
+
+// ---- titleFromOutput：剥掉 emoji 与图形符号 ----
+// 覆盖 emoji 主体、国旗、纯 emoji 标题；多行时只看第一行。
+assert.equal(titleFromOutput("修复登录 Bug 🐛"), "修复登录 Bug", "trailing emoji is stripped");
+assert.equal(titleFromOutput("🎉 发布新版本"), "发布新版本", "leading emoji plus space is stripped");
+assert.equal(titleFromOutput("标题🇨🇳测试"), "标题测试", "regional indicators (flags) are stripped");
+assert.equal(titleFromOutput("标题\r\n第二行🎉"), "标题", "emoji on a later line never reaches the title");
+assert.equal(titleFromOutput("🎉🐛🚀"), "", "an emoji-only title becomes empty");
+assert.equal(stripEmoji("a👍b"), "ab", "stripEmoji keeps surrounding text");
+assert.equal(stripEmoji(undefined), "", "stripEmoji tolerates non-strings");
 
 // ---- titleFromResponse：收尾判定 ----
 const textBlock = (text) => ({ type: "text", text });
@@ -207,10 +216,10 @@ assert.throws(
 const prompt = buildSystemPrompt({ targetWords: 4, targetCjkCharacters: 12 }, false);
 assert.ok(prompt.includes("about 4 words"), "the prompt must carry the derived word target");
 assert.ok(prompt.includes("12 CJK characters"), "the prompt must carry the CJK target");
+assert.ok(prompt.includes("Do not include emojis"), "the prompt must forbid emoji up front");
 assert.ok(!prompt.includes("currentTitle"), "no anchor rules when there is no current title");
 // 有锚点时追加四条稳定性规则：防止同话题追问把标题改成同义词而抖动，
-// 但话题真的换了必须明确换标题——旧版「only when materially change」门槛过高，
-// 实测把标题钉死（某会话 29 次刷新一字未改）。两条都要守。
+// 稳定性规则要求：同话题保持原词，换话题必须写新标题。
 const anchored = buildSystemPrompt({ targetWords: 4, targetCjkCharacters: 12 }, true);
 assert.ok(anchored.includes("currentTitle"));
 assert.ok(anchored.includes("return it exactly unchanged"), "same-topic follow-ups keep the exact wording");
@@ -228,7 +237,7 @@ assert.equal(
   `Update the session title from this JSON object:\n${JSON.stringify({ currentTitle: "旧标题", messages: rows })}`
 );
 
-// ---- clampTitle：官方完全不截，长度只能自己守 ----
+// ---- clampTitle：宿主不截断，长度需自行约束 ----
 // 口径是显示宽度（半角单位）：中日韩字算 2，其余含空格算 1。
 // 预算 = 中文字数上限 × 2，所以「中文 12 字」与「英文 24 字符（含空格）」等宽，
 // 不必再为英文单设一个数。
@@ -296,9 +305,7 @@ assert.equal(clampTitle(undefined, 12), undefined);
 }
 
 // ---- 推理预算：只有「真在推理且关不掉」才抬上限 ----
-// maxTokens 与答案共享：@earendil-works/pi-ai 的 MIN_ANSWER_TOKENS=1024，预算不足时
-// 它把 thinking budget 压成 0 却照样发 reasoning_effort，模型照样思考、照样吃光
-// 上限，标题为空且界面静默。抬上限是唯一能从外部干预的地方。
+// 推理与答案共享预算，预算不足时思考会占满上限导致标题为空。
 {
   const efforts = (...ids) => ({ reasoning: { efforts: ids.map((id) => ({ id, name: id })) } });
 
@@ -333,8 +340,7 @@ assert.equal(clampTitle(undefined, 12), undefined);
     REASONING_TOKEN_FLOOR,
     "an explicit reasoning effort still needs the floor"
   );
-  // 实测校准：64/256/1024 全被吃光，2048 也有一次 reasoning=2048 → stop=length、答案 0 token。
-  // 成功案例的 reasoning 最高 3172，所以下限必须高过它，给答案留余量。
+  // 下限取 schema 允许的最大值，确保思考之外仍留有答案预算。
   assert.ok(REASONING_TOKEN_FLOOR >= 4096, "the floor covers the worst observed reasoning and still leaves room");
 }
 
@@ -403,6 +409,7 @@ const shorten = buildShortenPrompt({ targetCjkCharacters: 12 });
 assert.ok(shorten.includes("12 CJK characters"), "shorten prompt must name the hard budget");
 assert.ok(shorten.includes("24 half-width units"), "and its half-width equivalent");
 assert.ok(shorten.includes("Keep the meaning"), "shortening must preserve the topic");
+assert.ok(shorten.includes("Do not include emojis"), "shortening must also forbid emoji");
 assert.ok(shorten.includes("Return only the shortened title on one line"));
 assert.equal(
   frameShorten("一个很长的标题"),
