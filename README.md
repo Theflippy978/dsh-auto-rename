@@ -8,7 +8,7 @@
 Titles are generated from the conversation and updated as it develops; the rename dialog
 streams AI suggestions.
 
-[![version](https://img.shields.io/badge/version-0.2.4-4176e6)](package.json)
+[![version](https://img.shields.io/badge/version-0.3.0-4176e6)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-4176e6)](LICENSE)
 [![dsh](https://img.shields.io/badge/DSH-0.2.2--rc.5-6b7280)](#known-limits)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.19-6b7280)](package.json)

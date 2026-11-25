@@ -127,6 +127,7 @@ assert.deepEqual(Object.keys(Config.dict), [
   "timeoutMs",
   "suggestionCount",
   "autoRenameEnabled",
+  "allowUnlock",
   "reasoningEffort"
 ], "the config schema must expose exactly the user-facing fields");
 
@@ -184,13 +185,14 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.equal(provider.automatic, "all-prompts", "every new human message refreshes the title");
   assert.equal(typeof provider.generate, "function");
 
-  // 路由形状：config 读、settings 写（设置面板）、suggest 拉建议
+  // 路由形状：config 读、settings 写（设置面板）、suggest 拉建议、refresh-title 解除手动固定
   assert.deepEqual(
     routes.map((route) => [route.kind, route.path]),
     [
       ["exact", "/dsh-auto-rename/config"],
       ["exact", "/dsh-auto-rename/settings"],
-      ["exact", "/dsh-auto-rename/suggest"]
+      ["exact", "/dsh-auto-rename/suggest"],
+      ["exact", "/dsh-auto-rename/refresh-title"]
     ]
   );
   assert.ok(routes.every((route) => typeof route.handler === "function"));
@@ -1018,4 +1020,87 @@ assert.deepEqual(Object.keys(Config.dict), [
   assert.match(res.body.error, /must be configured together/);
 }
 
-console.log("apply smoke ok: metadata, degrade, provider shape, routes, guards, config echo");
+// ---- 8. /refresh-title：解除手动锁定，走宿主的 refresh ----
+
+{
+  const { ctx, services, routes } = makeCtx();
+  const liveSession = { id: "live" };
+  let refreshArg;
+  const refreshResult = { title: "AI 生成的新标题", source: { kind: "provider" } };
+  services.set("sessionTitle", {
+    register: () => {},
+    refresh: (session) => { refreshArg = session; return Promise.resolve(refreshResult); }
+  });
+  services.set("llm", {});
+  services.set("sessions", { get: (id) => (id === "live" ? liveSession : undefined) });
+  services.set("webServer", makeWebServer(routes));
+  apply(ctx, {});
+  const route = routes.find((r) => r.path === "/dsh-auto-rename/refresh-title");
+  assert.ok(route, "refresh-title route must be registered");
+
+  let res = makeRes();
+  await route.handler(makeReq({}), res);
+  assert.equal(res.status, 400, "missing sessionId is rejected");
+
+  res = makeRes();
+  await route.handler(makeReq({ sessionId: "gone" }), res);
+  assert.equal(res.status, 404, "a non-live session is rejected");
+  assert.equal(refreshArg, undefined, "refresh must not be called for a missing session");
+
+  res = makeRes();
+  await route.handler(makeReq({ sessionId: "live" }), res);
+  assert.equal(res.status, 200, "a live session is refreshed");
+  assert.equal(refreshArg, liveSession, "refresh receives the live session object");
+  assert.equal(res.body.value.title, refreshResult.title, "the new title is returned to the client");
+  assert.equal(res.body.value.source.kind, "provider", "the new source is returned so the client can update lock state");
+}
+
+// refresh 抛错时返回 500，不吞成成功
+{
+  const { ctx, services, routes } = makeCtx();
+  services.set("sessionTitle", {
+    register: () => {},
+    refresh: () => Promise.reject(new Error("refresh exploded"))
+  });
+  services.set("llm", {});
+  services.set("sessions", { get: () => ({ id: "live" }) });
+  services.set("webServer", makeWebServer(routes));
+  apply(ctx, {});
+  const res = makeRes();
+  await routes.find((r) => r.path === "/dsh-auto-rename/refresh-title").handler(makeReq({ sessionId: "live" }), res);
+  assert.equal(res.status, 500, "a failing refresh surfaces as 500");
+  assert.match(res.body.error, /refresh exploded/);
+}
+
+// 宿主没有 refresh 能力时明确失败，不假装成功
+{
+  const { ctx, services, routes } = makeCtx();
+  services.set("sessionTitle", { register: () => {} });
+  services.set("llm", {});
+  services.set("sessions", { get: () => ({ id: "live" }) });
+  services.set("webServer", makeWebServer(routes));
+  apply(ctx, {});
+  const res = makeRes();
+  await routes.find((r) => r.path === "/dsh-auto-rename/refresh-title").handler(makeReq({ sessionId: "live" }), res);
+  assert.equal(res.status, 503, "an unsupported refresh fails loudly");
+}
+
+// allowUnlock 是布尔白名单字段：写入生效，非布尔被丢弃
+{
+  const { ctx, services, routes } = makeCtx();
+  let written;
+  services.set("sessionTitle", { register: () => {} });
+  services.set("llm", {});
+  services.set("sessions", { get: () => undefined });
+  services.set("settings", { update: async (_ns, patch) => { written = patch; } });
+  services.set("webServer", makeWebServer(routes));
+  apply(ctx, {});
+  const settingsRoute = routes.find((r) => r.path === "/dsh-auto-rename/settings");
+  await settingsRoute.handler(makeReq({ allowUnlock: false }), makeRes());
+  assert.equal(written.allowUnlock, false, "allowUnlock is written through the settings bridge");
+  written = undefined;
+  await settingsRoute.handler(makeReq({ allowUnlock: "false" }), makeRes());
+  assert.equal(written, undefined, "a non-boolean allowUnlock is dropped by the whitelist");
+}
+
+console.log("apply smoke ok: metadata, degrade, provider shape, routes, guards, config echo, refresh-title, allowUnlock");

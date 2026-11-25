@@ -586,7 +586,8 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   }
   const dialog = renderComponent(component, { sessionId: "s1" }).children[1];
   const modal = renderNode(dialog);
-  const stripElement = modal.children[2];
+  const stripElement = flattenChildren(modal).find((child) => child.props?.store !== undefined && child.props?.onPick !== undefined);
+  assert.ok(stripElement, "the suggestion strip is rendered");
   stripElement.props.store.set({ status: "ready", titles: [] });
   const strip = renderNode(stripElement);
   const regenerate = strip.children.at(-1);
@@ -680,7 +681,7 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   http.restore();
 
   const dialog = renderComponent(component, { sessionId: "s1" }).children[1];
-  const stripElement = renderNode(dialog).children[2];
+  const stripElement = flattenChildren(renderNode(dialog)).find((child) => child.props?.store !== undefined && child.props?.onPick !== undefined);
   const titles = candidatesOf(renderNode(stripElement)).map((node) => node.props.title);
   assert.deepEqual(titles, ["拆开的建议"], "a line split across chunks is reassembled, not dropped");
 }
@@ -723,8 +724,9 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   assert.equal(modal.type, "Modal", "the dialog is still the host Modal");
   assert.equal(modal.props.className, "dsh-auto-rename-dialog", "the height cap reaches the Modal");
   assert.equal(modal.props.contentClassName, "dsh-auto-rename-dialog-content", "so does the scroll region");
-  // 首个子节点就是设置图标：它按绝对定位钉进标题行，DOM 顺序不决定视觉位置。
-  const gear = modal.children[0];
+  // 按类名找设置图标：锁图标可能占据前面的子节点，DOM 顺序不决定视觉位置。
+  const gear = flattenChildren(modal).find((child) => child.type === "button" && child.props.className === "dsh-auto-rename-settings");
+  assert.ok(gear, "the settings gear is rendered");
   assert.equal(gear.type, "button", "the gear is a native button (keyboard + AT semantics)");
   assert.equal(gear.props.className, "dsh-auto-rename-settings");
   assert.equal(gear.props["aria-expanded"], false, "collapsed until asked");
@@ -1402,4 +1404,85 @@ assert.deepEqual(exports.inject, ["slots", "locale", "sessions"], "client inject
   });
 }
 
-console.log("client smoke ok: header entry, official settings card, inject never throws, failures degrade");
+// ---- 9. 锁定状态读取：从 session/title 事件按 last-wins 取来源 ----
+{
+  const { readSourceKind } = exports.__test;
+  const records = [
+    { event: { type: "user/message", seq: 1, data: { source: { kind: "user" } } } },
+    { event: { type: "session/title", seq: 2, data: { source: { kind: "user" } } } },
+    { event: { type: "session/title", seq: 3, data: { source: { kind: "provider", provider: "acme" } } } }
+  ];
+  const remote = { events: async () => ({ records, hasMore: false }) };
+  const ctx = { get: (name) => (name === "remote.session" ? remote : undefined) };
+  assert.equal(await readSourceKind(ctx, "s1"), "provider", "last title event wins, user/message is ignored");
+
+  const userOnly = { events: async () => ({ records: records.slice(0, 2), hasMore: false }) };
+  assert.equal(await readSourceKind({ get: () => userOnly }, "s1"), "user", "a user-sourced title means locked");
+
+  // remote 服务把分页结果包在 {ok, value} 信封里。
+  const enveloped = { events: async () => ({ ok: true, value: { records: records.slice(0, 2), hasMore: false } }) };
+  assert.equal(await readSourceKind({ get: () => enveloped }, "s1"), "user", "remote result envelope is unwrapped");
+
+  const missing = { get: () => undefined };
+  assert.equal(await readSourceKind(missing, "s1"), null, "no remote.session degrades to unlocked");
+
+  const throwing = { events: async () => { throw new Error("offline"); } };
+  assert.equal(await readSourceKind({ get: () => throwing }, "s1"), null, "a failed read degrades to unlocked");
+}
+
+// 翻页：第一页没有标题事件时向前翻，直到找到
+{
+  const { readSourceKind } = exports.__test;
+  const pages = [
+    { records: [{ event: { type: "user/message", seq: 10, data: {} } }], hasMore: true },
+    { records: [{ event: { type: "session/title", seq: 4, data: { source: { kind: "user" } } } }], hasMore: false }
+  ];
+  let call = 0;
+  const remote = { events: async () => pages[call++] };
+  assert.equal(await readSourceKind({ get: () => remote }, "s1"), "user", "paging finds an earlier title event");
+  assert.equal(call, 2, "two pages were read");
+}
+
+// ---- 10. 顶部锁图标：锁定时出现，禁止解锁时灰掉不可点，点击走 /refresh-title ----
+{
+  const slots = makeSlots();
+  await exports.apply(makeCtx(slots, makeSessions(), makeConfigForms()));
+  const component = slots.of(HEADER)[0].component;
+  const { lockStore } = exports.__test;
+
+  lockStore.set({ sessionId: "s1", locked: false, allowUnlock: true });
+  let tree = renderComponent(component, { sessionId: "s1" });
+  assert.equal(flattenChildren(tree).find((c) => c.props?.className === "dsh-auto-rename-lock-header"), undefined, "no lock icon when unlocked");
+
+  lockStore.set({ sessionId: "s1", locked: true, allowUnlock: false });
+  tree = renderComponent(component, { sessionId: "s1" });
+  const locked = flattenChildren(tree).find((c) => c.props?.className === "dsh-auto-rename-lock-header");
+  assert.ok(locked, "a locked session shows a lock icon");
+  assert.equal(locked.props.disabled, true, "disallowed unlock greys the icon out");
+  assert.equal(locked.props["aria-label"], "lock.disabled", "the disabled icon explains why");
+
+  lockStore.set({ sessionId: "s1", locked: true, allowUnlock: true });
+  tree = renderComponent(component, { sessionId: "s1" });
+  const enabled = flattenChildren(tree).find((c) => c.props?.className === "dsh-auto-rename-lock-header");
+  assert.equal(enabled.props.disabled, false, "an allowed unlock is clickable");
+
+  // 点击锁：POST 到 /refresh-title，成功后本地状态解锁。
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, status: 200, json: async () => ({ ok: true, value: { title: "新的 AI 标题", source: { kind: "provider" } } }) };
+  };
+  try {
+    await enabled.props.onClick();
+    await flush();
+    assert.equal(calls.length, 1, "one refresh-title request");
+    assert.equal(calls[0].url, "/dsh-auto-rename/refresh-title", "unlock hits the refresh route");
+    assert.deepEqual(calls[0].body, { sessionId: "s1" }, "the request carries the session id");
+    assert.equal(lockStore.getSnapshot().locked, false, "local lock state clears after a successful unlock");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+console.log("client smoke ok: header entry, official settings card, inject never throws, failures degrade, lock icon, title source");
